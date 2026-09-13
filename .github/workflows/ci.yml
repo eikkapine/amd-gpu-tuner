@@ -15,7 +15,7 @@ jobs:
       matrix:
         python: ['3.12', '3.13']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -27,7 +27,7 @@ jobs:
     name: ADLX bridge / Windows x64
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build against pinned ADLX SDK
         shell: pwsh
         run: ./scripts/build_bridge.ps1
