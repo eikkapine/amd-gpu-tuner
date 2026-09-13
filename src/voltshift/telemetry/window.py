@@ -46,7 +46,7 @@ class WindowStats:
                        None, None, None, None, False)
 
         def mean(values: list[float]) -> Optional[float]:
-            usable = [v for v in values if v is not None]
+            usable = [v for v in values if v is not None and math.isfinite(v)]
             return sum(usable) / len(usable) if usable else None
 
         framed = [s for s in samples if s.frames is not None]
@@ -69,7 +69,8 @@ class WindowStats:
             elif util is not None:
                 perf_per_watt = util / board_w
 
-        hotspots = [s.hotspot_c for s in samples if s.hotspot_c is not None]
+        hotspots = [s.hotspot_c for s in samples
+                    if s.hotspot_c is not None and math.isfinite(s.hotspot_c)]
 
         return cls(
             duration_sec=duration,
@@ -91,7 +92,10 @@ class WindowStats:
         )
 
     def is_usable(self, min_samples: int = 3) -> bool:
-        return self.sample_count >= min_samples
+        return self.sample_count >= min_samples and any(
+            value is not None and math.isfinite(value)
+            for value in (self.clock_mhz, self.board_w, self.hotspot_c,
+                          self.gpu_util_pct))
 
 
 @dataclass(frozen=True)
@@ -136,7 +140,7 @@ def paired_delta(candidate_values: Sequence[Optional[float]],
                  baseline_values: Sequence[Optional[float]]) -> PairedDelta:
     """Mean of (candidate - baseline) over matched pairs, with standard error."""
     pairs = [(c, b) for c, b in zip(candidate_values, baseline_values)
-             if c is not None and b is not None]
+             if c is not None and b is not None and math.isfinite(c) and math.isfinite(b)]
     if not pairs:
         return PairedDelta(0.0, 0.0, 0)
 
@@ -159,7 +163,8 @@ def relative_paired_delta(candidate_values: Sequence[Optional[float]],
     watts.
     """
     pairs = [(c, b) for c, b in zip(candidate_values, baseline_values)
-             if c is not None and b is not None and b != 0]
+             if c is not None and b is not None and b != 0
+             and math.isfinite(c) and math.isfinite(b)]
     if not pairs:
         return PairedDelta(0.0, 0.0, 0)
     ratios = [(c - b) / abs(b) for c, b in pairs]

@@ -88,5 +88,5 @@ Write-Host "Downloaded. SHA256 $hash" -ForegroundColor Green
 } | ConvertTo-Json | Set-Content -Path (Join-Path $targetDir "source.json") -Encoding utf8
 
 Write-Host ""
-Write-Host "VoltShift will pick this up automatically on next launch." -ForegroundColor Green
+Write-Host "AMD GPU Tuner will pick this up automatically on next launch." -ForegroundColor Green
 Write-Host "Verify with:  voltshift metrics" -ForegroundColor Cyan

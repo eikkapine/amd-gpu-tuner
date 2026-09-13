@@ -103,7 +103,7 @@ class AdaptivePage(Page):
         self._applied.pack(fill="x", pady=(12, 0))
 
     def _build_knowledge_card(self) -> None:
-        card = Card(self, title="What this card has taught VoltShift")
+        card = Card(self, title="What this GPU has learned")
         card.grid(row=2, column=0, sticky="ew", pady=(0, 12))
         body = card.body()
 

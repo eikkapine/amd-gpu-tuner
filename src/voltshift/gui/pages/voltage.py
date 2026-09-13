@@ -1,4 +1,4 @@
-"""Dynamic Voltage — VoltShift's identity page.
+"""Dynamic Voltage — AMD GPU Tuner identity page.
 
 Edit the clock->voltage thresholds, start/stop the engine, and watch the
 live core clock with the threshold offsets drawn as reference lines. The
@@ -149,6 +149,11 @@ class VoltagePage(Page):
         self._refresh_markers()
 
     def _load_from_config(self) -> None:
+        config = self.state.engine_config
+        self._loaded_config = config.to_dict()
+        self._idle_var.set(str(config.idle_offset_mv))
+        self._hyst_var.set(str(config.hysteresis_count))
+        self._poll_var.set(str(config.poll_interval_sec))
         for row in self._rows:
             row.destroy()
         self._rows.clear()
@@ -160,14 +165,18 @@ class VoltagePage(Page):
         thresholds = []
         for row in self._rows:
             vals = row.values()
-            if vals:
-                thresholds.append(Threshold(vals[0], vals[1]))
+            if vals is None:
+                raise ValueError(
+                    f"Invalid threshold values in row: clock='{row.clock_var.get()}', "
+                    f"offset='{row.offset_var.get()}'"
+                )
+            thresholds.append(Threshold(vals[0], vals[1]))
         try:
             idle = int(self._idle_var.get())
             hyst = int(self._hyst_var.get())
             poll = float(self._poll_var.get())
-        except ValueError:
-            idle, hyst, poll = -100, 2, 0.5
+        except ValueError as exc:
+            raise ValueError(f"Invalid engine setting: {exc}") from exc
         return EngineConfig(poll_interval_sec=poll, hysteresis_count=hyst,
                             idle_offset_mv=idle, thresholds=thresholds).clamped()
 
@@ -181,7 +190,11 @@ class VoltagePage(Page):
         self._graph.set_markers(markers, "clock")
 
     def _apply_config(self) -> None:
-        self.state.engine_config = self._collect_config()
+        try:
+            self.state.engine_config = self._collect_config()
+        except ValueError as exc:
+            self.state.log(str(exc), "error")
+            return
         self.state.save_settings()
         self._refresh_markers()
         self.state.log("Engine config saved")
@@ -194,13 +207,16 @@ class VoltagePage(Page):
         if self.state.engine_running:
             self.state.stop_engine()
             self._start_btn.configure(text="▶  Start engine", fg_color=theme.ACCENT_2)
-            self._status.configure(text="Stopped — GPU reset to factory",
-                                   text_color=theme.TEXT_DIM)
+            self._status.configure(text="Stopped", text_color=theme.TEXT_DIM)
         else:
             if not self.state.connected:
                 self.state.log("Cannot start — bridge not connected", "error")
                 return
-            self.state.engine_config = self._collect_config()
+            try:
+                self.state.engine_config = self._collect_config()
+            except ValueError as exc:
+                self.state.log(str(exc), "error")
+                return
             self.state.save_settings()
             self.state.start_engine()
             self._start_btn.configure(text="■  Stop engine", fg_color=theme.DANGER)
@@ -217,6 +233,8 @@ class VoltagePage(Page):
                                    text_color=theme.GOOD)
 
     def on_show(self) -> None:
+        if self.state.engine_config.to_dict() != self._loaded_config:
+            self._load_from_config()
         # Reflect engine state if it was toggled from elsewhere.
         if self.state.engine_running:
             self._start_btn.configure(text="■  Stop engine", fg_color=theme.DANGER)

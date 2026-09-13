@@ -155,3 +155,27 @@ def test_paired_delta_handles_missing_values():
     assert delta.pairs == 1
     assert delta.mean == pytest.approx(5.0)
     assert paired_delta([], []).pairs == 0
+
+
+def test_empty_hardware_samples_do_not_count_as_usable_telemetry():
+    window = WindowStats.from_samples([Sample(t=float(i)) for i in range(8)])
+    assert not window.is_usable()
+
+
+def test_nonfinite_sensor_values_are_treated_as_missing():
+    sample = Sample.from_metrics({"clockMhz": float("nan"),
+                                  "boardPowerW": float("inf"), "powerW": 250,
+                                  "hotspotC": "bad", "fanRpm": True}, t=1.0)
+    assert sample.clock_mhz is None
+    assert sample.board_w == 250
+    assert sample.hotspot_c is None
+    assert sample.fan_rpm is None
+
+
+def test_nonfinite_frames_and_pairs_are_ignored():
+    stats = FrameStats.from_frametimes([10, 10, float("inf"), float("nan")],
+                                      "test.exe", 1, "test")
+    assert stats.frame_count == 2
+    assert stats.fps_avg == 100
+    assert relative_paired_delta([10, float("inf")], [5, 10]).pairs == 1
+    assert paired_delta([float("nan"), 10], [3, 5]).mean == 5

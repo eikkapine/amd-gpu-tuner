@@ -34,10 +34,14 @@ json HandleLine(Registry& registry, Session& session, const std::string& line)
     try
     {
         json request = json::parse(line);
+        if (!request.is_object())
+            throw BridgeError("Request must be a JSON object");
         if (request.contains("id"))
             id = request["id"];
         std::string cmd = request.at("cmd").get<std::string>();
         json args = request.value("args", json::object());
+        if (!args.is_object())
+            throw BridgeError("Command args must be a JSON object");
 
         if (cmd == "quit")
         {
@@ -82,9 +86,17 @@ int main(int argc, char* argv[])
     if (argc > 1)
     {
         // One-shot mode for manual testing.
-        json request = {{"id", 0}, {"cmd", argv[1]},
-                        {"args", argc > 2 ? json::parse(argv[2]) : json::object()}};
-        json response = HandleLine(registry, session, request.dump());
+        json response;
+        try
+        {
+            json request = {{"id", 0}, {"cmd", argv[1]},
+                            {"args", argc > 2 ? json::parse(argv[2]) : json::object()}};
+            response = HandleLine(registry, session, request.dump());
+        }
+        catch (const std::exception& e)
+        {
+            response = {{"id", 0}, {"ok", false}, {"error", e.what()}};
+        }
         std::cout << response.dump(2) << std::endl;
         exitCode = response["ok"].get<bool>() ? 0 : 1;
     }

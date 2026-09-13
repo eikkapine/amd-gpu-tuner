@@ -1,4 +1,4 @@
-"""VoltShift command-line interface.
+"""AMD GPU Tuner command-line interface.
 
     voltshift autotune            find the best settings for what is running now
     voltshift benchtune           tune for maximum benchmark score (3DMark)
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import signal
 import sys
 import threading
@@ -84,35 +85,61 @@ def cmd_run(args) -> int:
 
         crash_logger = CrashLogger(config.to_dict())
         crash_logger.on_log_entry = _log
-        crash_logger.check_previous_session()
-        crash_logger.start()
-        crash_logger.write_session_header(gpu_name, config.to_dict())
+        runner = None
+        runner_started = False
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        handler_installed = False
+        try:
+            crash_logger.check_previous_session()
+            crash_logger.start()
+            crash_logger.write_session_header(gpu_name, config.to_dict())
 
-        runner = EngineRunner(bridge, config, crash_logger)
-        runner.on_log_entry = _log
-        if not args.quiet:
-            runner.on_sample = lambda s: print(
-                f"{C.DIM}  {s.get('clockMhz', '?'):>5} MHz  "
-                f"{(s.get('appliedOffsetMv') if s.get('appliedOffsetMv') is not None else 0):>+5} mV  "
-                f"{s.get('tempC', 0):>3.0f}°C  {s.get('boardPowerW', 0):>4.0f} W{C.RESET}",
-                end="\r")
+            runner = EngineRunner(bridge, config, crash_logger)
+            runner.on_log_entry = _log
+            if not args.quiet:
+                def show_sample(sample):
+                    def number(value, spec=".0f"):
+                        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                                or not math.isfinite(value)):
+                            return "-"
+                        return format(value, spec)
 
-        stop_requested = []
+                    clock = number(sample.get("clockMhz"))
+                    offset = number(sample.get("appliedOffsetMv"), "+.0f")
+                    temperature = number(sample.get("tempC"))
+                    power = number(sample.get("boardPowerW", sample.get("powerW")))
+                    print(f"{C.DIM}  {clock:>5} MHz  {offset:>5} mV  "
+                          f"{temperature:>3}°C  {power:>4} W{C.RESET}", end="\r")
 
-        def handle_sigint(_sig, _frame):
-            stop_requested.append(True)
+                runner.on_sample = show_sample
 
-        signal.signal(signal.SIGINT, handle_sigint)
-        runner.start()
-        _log("Engine running — Ctrl+C stops and restores factory tuning")
+            stop_requested = []
 
-        while runner.running and not stop_requested:
-            time.sleep(0.2)
+            def handle_sigint(_sig, _frame):
+                stop_requested.append(True)
 
-        print()
-        runner.stop(reset_gpu=True)
-        crash_logger.stop()
-        crash_logger.write_session_footer(crash_logger.crash_count)
+            signal.signal(signal.SIGINT, handle_sigint)
+            handler_installed = True
+            runner.start()
+            runner_started = True
+            _log("Engine running — Ctrl+C stops and restores factory tuning")
+
+            while runner.running and not stop_requested:
+                time.sleep(0.2)
+            print()
+        finally:
+            try:
+                if runner is not None:
+                    runner.stop(reset_gpu=runner_started)
+            finally:
+                try:
+                    crash_logger.stop()
+                finally:
+                    try:
+                        crash_logger.write_session_footer(crash_logger.crash_count)
+                    finally:
+                        if handler_installed:
+                            signal.signal(signal.SIGINT, previous_sigint)
         _log("Stopped cleanly")
     return 0
 
@@ -121,6 +148,9 @@ def cmd_info(args) -> int:
     with BridgeClient() as bridge:
         info = bridge.info()
         caps = bridge.caps()
+        if args.json:
+            print(json.dumps({"info": info, "caps": caps}, indent=2))
+            return 0
         _banner("GPU information")
         print(f"  GPU        : {info.get('name')}")
         print(f"  VRAM       : {info.get('vramMb')} MB {info.get('vramType')}")
@@ -138,9 +168,21 @@ def cmd_info(args) -> int:
         print(f"  At factory : {tuning.get('atFactory')}")
         print(f"  Displays   : {caps.get('displayCount')} · Eyefinity: {caps.get('eyefinity')}")
         print(f"  Bridge     : v{bridge.version}\n")
-        if args.json:
-            print(json.dumps({"info": info, "caps": caps}, indent=2))
     return 0
+
+
+def cmd_status(args) -> int:
+    from .diagnostics import collect_report, format_summary, save_report
+
+    with BridgeClient() as bridge:
+        report = collect_report(bridge)
+    if getattr(args, "output", None):
+        print(save_report(report, args.output))
+    elif args.json:
+        print(json.dumps(report, indent=2, allow_nan=False))
+    else:
+        print(format_summary(report))
+    return 1 if report["errors"].get("info") else 0
 
 
 def cmd_metrics(args) -> int:
@@ -234,22 +276,27 @@ def cmd_display(args) -> int:
 
 
 def cmd_profile(args) -> int:
+    if args.profile_cmd == "list":
+        for path in profile_store.list_profiles():
+            print(path)
+        return 0
+    if args.profile_cmd == "inspect":
+        print(json.dumps(profile_store.load(args.path), indent=2))
+        return 0
+    profile = profile_store.load(args.path) if args.profile_cmd == "load" else None
     with BridgeClient() as bridge:
-        if args.profile_cmd == "list":
-            entries = profile_store.list_profiles()
-            if not entries:
-                print("  No profiles saved yet.")
-            for path in entries:
-                print(f"  {path}")
-        elif args.profile_cmd == "save":
+        if args.profile_cmd == "save":
             engine_config = _load_engine_config(None)
-            profile = profile_store.capture(bridge, engine_config)
+            profile = profile_store.capture(bridge, engine_config, sections=args.sections)
             path = profile_store.save(profile, args.name)
             _log(f"Profile saved → {path}")
         elif args.profile_cmd == "load":
-            profile = profile_store.load(args.path)
-            for line in profile_store.apply(bridge, profile):
+            log = profile_store.apply(bridge, profile, sections=args.sections)
+            for line in log:
                 _log(line)
+            failed = any(line.startswith("skipped:") and
+                         not line.startswith("skipped: engine configuration") for line in log)
+            return 1 if failed else 0
     return 0
 
 
@@ -490,7 +537,7 @@ def cmd_knowledge(args) -> int:
     try:
         if args.knowledge_cmd == "stats":
             stats = store.stats(key)
-            _banner("what VoltShift has learned")
+            _banner("learned GPU settings")
             print(f"  observations   {stats['observations']}")
             print(f"  games          {stats['games']}")
             print(f"  unsafe configs {stats['unsafe']}")
@@ -516,7 +563,7 @@ def cmd_knowledge(args) -> int:
             removed = store.reset_frontier(key)
             _log(f"cleared the stability frontier ({removed} band(s)) and the "
                  f"unsafe set for this card", "volt")
-            _log("VoltShift will relearn the card's limits from scratch")
+            _log("AMD GPU Tuner will relearn the card's limits from scratch")
         elif args.knowledge_cmd == "export":
             print(json.dumps(store.export(), indent=2))
     finally:
@@ -526,9 +573,30 @@ def cmd_knowledge(args) -> int:
 
 # ── parser ────────────────────────────────────────────────────────────────────
 
+def positive_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number greater than zero")
+    return number
+
+
+def nonnegative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return number
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="voltshift", description=f"{APP_NAME} — AMD Radeon tuning suite")
+        prog="amd-gpu-tuner", description=f"{APP_NAME} — AMD Radeon tuning suite")
     parser.add_argument("--version", action="version",
                         version=f"{APP_NAME} {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -542,9 +610,17 @@ def build_parser() -> argparse.ArgumentParser:
     info.add_argument("--json", action="store_true")
     info.set_defaults(fn=cmd_info)
 
+    status = sub.add_parser("status", help="read-only GPU, tuning and telemetry snapshot")
+    status.add_argument("--json", action="store_true", help="machine-readable output")
+    status.set_defaults(fn=cmd_status)
+
+    diagnostics = sub.add_parser("diagnostics", help="export a read-only hardware report")
+    diagnostics.add_argument("--output", required=True, help="destination JSON file")
+    diagnostics.set_defaults(fn=cmd_status, json=True)
+
     metrics = sub.add_parser("metrics", help="live metrics")
     metrics.add_argument("-w", "--watch", action="store_true")
-    metrics.add_argument("--interval", type=float, default=0.5)
+    metrics.add_argument("--interval", type=positive_float, default=0.5)
     metrics.add_argument("--json", action="store_true")
     metrics.set_defaults(fn=cmd_metrics)
 
@@ -595,7 +671,13 @@ def build_parser() -> argparse.ArgumentParser:
     profile_sub.add_parser("list", help="list saved profiles")
     p = profile_sub.add_parser("save", help="capture current state")
     p.add_argument("name")
+    p.add_argument("--sections", nargs="+", choices=profile_store.SECTIONS,
+                   help="capture only these sections")
     p = profile_sub.add_parser("load", help="apply a profile file")
+    p.add_argument("path")
+    p.add_argument("--sections", nargs="+", choices=profile_store.SECTIONS,
+                   help="apply only these sections (engine config does not auto-start)")
+    p = profile_sub.add_parser("inspect", help="validate and print a profile without GPU access")
     p.add_argument("path")
     profile.set_defaults(fn=cmd_profile)
 
@@ -608,11 +690,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="find the best settings for the running workload")
     auto.add_argument("--goal", choices=sorted(GOALS), default=DEFAULT_GOAL,
                       help="what to optimise for (default: %(default)s)")
-    auto.add_argument("--trials", type=int, default=14,
+    auto.add_argument("--trials", type=positive_int, default=14,
                       help="how many configurations to try (default: %(default)s)")
-    auto.add_argument("--window", type=float, default=8.0,
+    auto.add_argument("--window", type=positive_float, default=8.0,
                       help="seconds measured per window (default: %(default)s)")
-    auto.add_argument("--pairs", type=int, default=2,
+    auto.add_argument("--pairs", type=positive_int, default=2,
                       help="candidate/baseline pairs per trial (default: %(default)s)")
     auto.add_argument("--game", help="attribute results to this exe name")
     auto.add_argument("--no-download", action="store_true",
@@ -622,15 +704,15 @@ def build_parser() -> argparse.ArgumentParser:
     adaptive = sub.add_parser("adaptive",
                               help="run the live governor while you play")
     adaptive.add_argument("--goal", choices=sorted(GOALS), default=DEFAULT_GOAL)
-    adaptive.add_argument("--probes", type=int, default=8,
+    adaptive.add_argument("--probes", type=nonnegative_int, default=8,
                           help="in-game experiments allowed per game, 0 to disable")
-    adaptive.add_argument("--probe-interval", type=float, default=120.0,
+    adaptive.add_argument("--probe-interval", type=positive_float, default=120.0,
                           help="minimum seconds between probes (default: %(default)s)")
     adaptive.add_argument("--no-download", action="store_true",
                           help="do not fetch PresentMon if it is missing")
     adaptive.set_defaults(fn=cmd_adaptive)
 
-    knowledge = sub.add_parser("knowledge", help="inspect what VoltShift has learned")
+    knowledge = sub.add_parser("knowledge", help="inspect learned GPU settings")
     knowledge_sub = knowledge.add_subparsers(dest="knowledge_cmd", required=True)
     knowledge_sub.add_parser("stats", help="summary and stability frontier")
     knowledge_sub.add_parser("games", help="best configuration per game")
@@ -646,11 +728,11 @@ def build_parser() -> argparse.ArgumentParser:
         "benchtune", help="tune for maximum benchmark score (3DMark, Time Spy…)")
     bench.add_argument("--test", default="TimeSpy",
                        help="benchmark to tune for (default: %(default)s)")
-    bench.add_argument("--trials", type=int, default=20,
+    bench.add_argument("--trials", type=positive_int, default=20,
                        help="configurations to try (default: %(default)s)")
-    bench.add_argument("--timeout", type=float, default=1200.0,
+    bench.add_argument("--timeout", type=positive_float, default=1200.0,
                        help="seconds to wait for each run (default: %(default)s)")
-    bench.add_argument("--min-gain", type=float, default=0.4,
+    bench.add_argument("--min-gain", type=positive_float, default=0.4,
                        help="percent gain that counts as real, not run-to-run "
                             "noise (default: %(default)s)")
     bench.add_argument("--no-seed", action="store_true",
@@ -671,8 +753,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.fn(args)
-    except BridgeError as exc:
-        _log(str(exc), "error")
+    except (BridgeError, ValueError, OSError) as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

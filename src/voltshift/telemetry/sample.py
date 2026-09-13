@@ -69,7 +69,8 @@ class FrameStats:
                         source: str, gpu_busy_ms: Optional[Sequence[float]] = None
                         ) -> Optional["FrameStats"]:
         """Build stats from raw per-frame present intervals (milliseconds)."""
-        usable = [ft for ft in frametimes_ms if ft and ft > 0]
+        usable = [ft for ft in frametimes_ms
+                  if ft is not None and math.isfinite(ft) and ft > 0]
         if len(usable) < 2:
             return None
 
@@ -81,7 +82,8 @@ class FrameStats:
 
         busy_avg = None
         if gpu_busy_ms:
-            busy = [b for b in gpu_busy_ms if b is not None and b >= 0]
+            busy = [b for b in gpu_busy_ms
+                    if b is not None and math.isfinite(b) and b >= 0]
             if busy:
                 busy_avg = sum(busy) / len(busy)
 
@@ -123,21 +125,26 @@ class Sample:
     def from_metrics(cls, metrics: dict, t: float,
                      frames: Optional[FrameStats] = None,
                      applied_offset_mv: Optional[int] = None) -> "Sample":
-        power = metrics.get("boardPowerW")
+        def value(name):
+            raw = metrics.get(name)
+            return raw if (isinstance(raw, (int, float))
+                           and not isinstance(raw, bool) and math.isfinite(raw)) else None
+
+        power = value("boardPowerW")
         if power is None:
-            power = metrics.get("powerW")
+            power = value("powerW")
         return cls(
             t=t,
-            clock_mhz=metrics.get("clockMhz"),
-            vram_clock_mhz=metrics.get("vramClockMhz"),
-            temp_c=metrics.get("tempC"),
-            hotspot_c=metrics.get("hotspotC"),
-            intake_c=metrics.get("intakeC"),
+            clock_mhz=value("clockMhz"),
+            vram_clock_mhz=value("vramClockMhz"),
+            temp_c=value("tempC"),
+            hotspot_c=value("hotspotC"),
+            intake_c=value("intakeC"),
             board_w=power,
-            fan_rpm=metrics.get("fanRpm"),
-            gpu_util_pct=metrics.get("usagePct"),
-            vram_used_mb=metrics.get("vramUsedMb"),
-            voltage_mv=metrics.get("voltageMv"),
+            fan_rpm=value("fanRpm"),
+            gpu_util_pct=value("usagePct"),
+            vram_used_mb=value("vramUsedMb"),
+            voltage_mv=value("voltageMv"),
             applied_offset_mv=applied_offset_mv,
             frames=frames,
             raw=metrics,

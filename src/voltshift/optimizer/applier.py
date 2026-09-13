@@ -40,7 +40,11 @@ class TuningApplier:
 
     def read_current(self) -> dict:
         """Current values for every knob in the space, as absolute values."""
-        tuning = self._bridge.tuning_get()
+        raw = self._tuning_values(self._bridge.tuning_get())
+        return {k.name: raw[k.name] for k in self._space.knobs if k.name in raw}
+
+    @staticmethod
+    def _tuning_values(tuning: dict) -> dict:
         gfx = tuning.get("gfx", {})
         vram = tuning.get("vram", {})
         power = tuning.get("power", {})
@@ -51,8 +55,55 @@ class TuningApplier:
             VRAM_CLOCK: vram.get("maxFreqMhz"),
             POWER_LIMIT: power.get("powerLimit"),
         }
-        return {k.name: raw[k.name] for k in self._space.knobs
-                if raw.get(k.name) is not None}
+        return {name: value for name, value in raw.items() if value is not None}
+
+    def _reset_extras(self, tuning: dict) -> dict:
+        """Capture controls outside the optimiser before a global reset."""
+        extras = {}
+        for section, flag, field in (("vram", "timingSupported", "timing"),
+                                     ("power", "tdcSupported", "tdcLimit")):
+            data = tuning.get(section, {})
+            if data.get(flag):
+                if type(data.get(field)) is not int:
+                    raise BridgeError(f"cannot preserve {field} across a factory reset")
+                extras[field] = data[field]
+        fan_supported = self._bridge.caps().get("tuning", {}).get("manualFan")
+        if type(fan_supported) is not bool:
+            raise BridgeError("cannot determine fan support before a factory reset")
+        if fan_supported:
+            fans = self._bridge.fans_get()
+            if not fans.get("curve") or type(fans.get("zeroRpmSupported")) is not bool:
+                raise BridgeError("cannot preserve fan tuning across a factory reset")
+            if fans["zeroRpmSupported"] and type(fans.get("zeroRpm")) is not bool:
+                raise BridgeError("cannot preserve ZeroRPM across a factory reset")
+            extras["fans"] = fans
+        return extras
+
+    def _restore_extras(self, extras: dict) -> None:
+        if "timing" in extras:
+            self._bridge.set_memory_timing(extras["timing"])
+        if "tdcLimit" in extras:
+            self._bridge.set_tdc(extras["tdcLimit"])
+        if "fans" in extras:
+            fans = extras["fans"]
+            self._bridge.set_fan_curve(fans["curve"])
+            if fans["zeroRpmSupported"]:
+                self._bridge.set_zero_rpm(fans["zeroRpm"])
+
+    def _verify_reset_restore(self, config: dict, extras: dict) -> None:
+        tuning = self._bridge.tuning_get()
+        current = self._tuning_values(tuning)
+        if any(current.get(name) != value for name, value in config.items()):
+            raise BridgeError("tuning readback differs after restoring a factory reset")
+        for section, field in (("vram", "timing"), ("power", "tdcLimit")):
+            if field in extras and tuning.get(section, {}).get(field) != extras[field]:
+                raise BridgeError(f"{field} was not restored after a factory reset")
+        if "fans" in extras:
+            expected, actual = extras["fans"], self._bridge.fans_get()
+            if (actual.get("curve") != expected["curve"]
+                    or (expected["zeroRpmSupported"]
+                        and actual.get("zeroRpm") != expected["zeroRpm"])):
+                raise BridgeError("fan tuning was not restored after a factory reset")
 
     def read_defaults(self) -> dict:
         """The card's factory values, where ADLX reports them."""
@@ -76,47 +127,64 @@ class TuningApplier:
     def apply(self, config: dict, skip_unchanged: bool = True) -> list[str]:
         """Write a configuration. Returns a log of what happened.
 
-        Clocks go before voltage: raising a clock ceiling at an already-low
-        voltage is the ordering most likely to be unstable, so the voltage
-        write lands last and the card spends no time in the risky in-between.
+        Failed writes propagate to the session's recovery path. The cache is
+        discarded on any failure because a driver call may partially apply.
+        Raising an absolute MGT2 voltage needs a factory reset; do that before
+        restoring the other controls so the reset cannot erase their writes.
         """
         applied: list[str] = []
         with self._lock:
             previous = self._last_applied or {}
+            config = {k: v for k, v in config.items() if v is not None}
+            reset_extras = None
+
+            try:
+                if VOLTAGE in config and not self._space.voltage_is_offset:
+                    tuning = self._bridge.tuning_get()
+                    current = self._tuning_values(tuning)
+                    voltage = current.get(VOLTAGE)
+                    if voltage is None:
+                        raise BridgeError("cannot read current voltage to compute a delta")
+                    if config[VOLTAGE] > voltage:
+                        full_space = SearchSpace.from_tuning(tuning)
+                        if any(name not in current for name in full_space.names):
+                            raise BridgeError("cannot preserve incomplete tuning across a factory reset")
+                        reset_extras = self._reset_extras(tuning)
+                        # Include controls excluded from the active search space.
+                        config = {**current, **config}
+                        self._bridge.tuning_reset()
+                        self._last_applied = None
+                        previous = {}
+            except Exception:
+                self._last_applied = None
+                raise
 
             def changed(name: str) -> bool:
                 if name not in config or config[name] is None:
                     return False
                 return not skip_unchanged or previous.get(name) != config[name]
 
-            if changed(MIN_CLOCK) or changed(MAX_CLOCK):
-                try:
+            try:
+                if changed(MIN_CLOCK) or changed(MAX_CLOCK):
                     self._bridge.set_core_clocks(config.get(MIN_CLOCK),
                                                  config.get(MAX_CLOCK))
                     applied.append("core clocks")
-                except BridgeError as exc:
-                    self._log(f"core clock write failed: {exc}", "error")
-
-            if changed(VRAM_CLOCK):
-                try:
+                if changed(VRAM_CLOCK):
                     self._bridge.set_vram_max(config[VRAM_CLOCK])
                     applied.append("vram clock")
-                except BridgeError as exc:
-                    self._log(f"vram clock write failed: {exc}", "error")
-
-            if changed(POWER_LIMIT):
-                try:
+                if changed(POWER_LIMIT):
                     self._bridge.set_power_limit(config[POWER_LIMIT])
                     applied.append("power limit")
-                except BridgeError as exc:
-                    self._log(f"power limit write failed: {exc}", "error")
-
-            if changed(VOLTAGE):
-                try:
+                if changed(VOLTAGE):
                     self._write_voltage(config[VOLTAGE])
                     applied.append("voltage")
-                except BridgeError as exc:
-                    self._log(f"voltage write failed: {exc}", "error")
+                if reset_extras is not None:
+                    self._restore_extras(reset_extras)
+                    self._verify_reset_restore(config, reset_extras)
+            except Exception as exc:
+                self._last_applied = None
+                self._log(f"tuning write failed: {exc}", "error")
+                raise
 
             merged = dict(previous)
             merged.update({k: v for k, v in config.items() if v is not None})
@@ -140,17 +208,7 @@ class TuningApplier:
         if delta == 0:
             return
         if delta > 0:
-            # The bridge refuses positive arguments as a safety rule, so
-            # raising voltage on MGT2 means resetting and reapplying from the
-            # factory baseline rather than nudging upward.
-            self._bridge.tuning_reset()
-            self._last_applied = None
-            baseline = self._bridge.tuning_get().get("gfx", {}).get("voltageMv")
-            if baseline is None:
-                raise BridgeError("cannot read baseline voltage after reset")
-            delta = int(target_mv) - int(baseline)
-            if delta >= 0:
-                return
+            raise BridgeError("requested voltage exceeds the factory baseline")
         self._bridge.set_voltage_offset(delta)
 
     def reset(self) -> list[str]:
@@ -161,8 +219,9 @@ class TuningApplier:
                 self._last_applied = None
                 return ["factory reset"]
             except BridgeError as exc:
+                self._last_applied = None
                 self._log(f"factory reset failed: {exc}", "error")
-                return []
+                raise
 
 
 class RecordingApplier:

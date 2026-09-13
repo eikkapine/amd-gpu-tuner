@@ -117,6 +117,19 @@ def score_trial(candidate: Sequence[WindowStats], baseline: Sequence[WindowStats
     if not candidate or not baseline:
         return Score(0.0, {}, 0.0, True, False, "no measurement")
 
+    hotspots = [w.hotspot_max_c for w in candidate if w.hotspot_max_c is not None]
+    if hotspots and max(hotspots) >= HOTSPOT_HARD_LIMIT_C:
+        return Score(-INSTABILITY_PENALTY, {}, 1.0, True, True,
+                     f"hotspot reached {max(hotspots):.0f}°C")
+
+    # A frame source dropping out changes the efficiency units from FPS/W
+    # to a clock-based proxy. Such windows cannot form a measured comparison.
+    paired = [(c, b) for c, b in zip(candidate, baseline)
+              if c.has_frames == b.has_frames and c.is_usable(1) and b.is_usable(1)]
+    if not paired:
+        return Score(0.0, {}, 0.0, True, False, "no comparable measurement")
+    candidate, baseline = zip(*paired)
+
     has_frames = any(w.has_frames for w in candidate) and any(w.has_frames for w in baseline)
     terms: dict[str, float] = {}
     total = 0.0
@@ -146,7 +159,6 @@ def score_trial(candidate: Sequence[WindowStats], baseline: Sequence[WindowStats
     add("fan", "fan_rpm", weights.noise, invert=True)
 
     # Absolute thermal guard, independent of how the baseline behaved.
-    hotspots = [w.hotspot_max_c for w in candidate if w.hotspot_max_c is not None]
     note = ""
     if hotspots:
         peak = max(hotspots)

@@ -1,4 +1,4 @@
-"""VoltShift GUI application shell.
+"""AMD GPU Tuner GUI application shell.
 
 Left sidebar navigates between pages; the top bar shows the GPU name and a
 compact always-on metrics strip; the content area hosts one page at a time.
@@ -49,15 +49,16 @@ NAV = [
 IDLE_POLL_MS = 700
 
 
-class VoltShiftApp(ctk.CTk):
+class AMDGPUTunerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME} — AMD Radeon tuning suite")
+        self.title(APP_NAME)
         self.geometry("1180x760")
         self.minsize(1000, 660)
         self.configure(fg_color=theme.BG)
 
         self.state_mgr = AppState(self)
+        self.attributes("-topmost", self.state_mgr.always_on_top)
         self._pages: dict[str, object] = {}
         self._nav_buttons: dict[str, ctk.CTkButton] = {}
         self._current: str | None = None
@@ -87,9 +88,9 @@ class VoltShiftApp(ctk.CTk):
 
         brand = ctk.CTkFrame(sidebar, fg_color="transparent")
         brand.pack(fill="x", padx=18, pady=(20, 24))
-        ctk.CTkLabel(brand, text="⚡ VoltShift", font=(theme.FONT, 20, "bold"),
+        ctk.CTkLabel(brand, text=APP_NAME, font=(theme.FONT, 18, "bold"),
                      text_color=theme.TEXT).pack(anchor="w")
-        ctk.CTkLabel(brand, text=f"v{__version__}", font=(theme.FONT, 10),
+        ctk.CTkLabel(brand, text=f"RADEON CONTROL  /  v{__version__}", font=(theme.FONT, 10),
                      text_color=theme.TEXT_FAINT).pack(anchor="w")
 
         for name, _cls in NAV:
@@ -104,6 +105,14 @@ class VoltShiftApp(ctk.CTk):
         self._conn_label = ctk.CTkLabel(sidebar, text="● connecting…",
                                         font=(theme.FONT, 11), text_color=theme.WARN)
         self._conn_label.pack(side="bottom", anchor="w", padx=18, pady=16)
+        self._topmost_var = ctk.BooleanVar(value=self.state_mgr.always_on_top)
+        ctk.CTkSwitch(sidebar, text="Always on top", variable=self._topmost_var,
+                       command=self._toggle_topmost, font=(theme.FONT, 11),
+                       progress_color=theme.ACCENT).pack(side="bottom", anchor="w", padx=18, pady=8)
+
+    def _toggle_topmost(self) -> None:
+        self.state_mgr.always_on_top = bool(self._topmost_var.get())
+        self.attributes("-topmost", self.state_mgr.always_on_top)
 
     def _build_topbar(self) -> None:
         bar = ctk.CTkFrame(self, fg_color=theme.BG, corner_radius=0, height=64)
@@ -217,26 +226,15 @@ class VoltShiftApp(ctk.CTk):
         except Exception:
             pass
         self.state_mgr.shutdown()
-        # Break the mainloop and let run() tear the window down. Destroying
-        # from inside this callback lets CustomTkinter's own scheduled `after`
-        # jobs re-enter destroy() (a known CTk teardown recursion); quitting
-        # first drains the loop so the later destroy() is a clean single pass.
+        # Exit the event loop before destroying widgets and scheduled jobs.
         self.quit()
 
 
 def run() -> None:
-    # Tkinter tears down its widget tree with one recursive call per nesting
-    # level. VoltShift's cards, scrollable pages, and per-feature rows nest
-    # deep enough to approach CPython's default 1000-frame limit on close, so
-    # give teardown headroom.
-    import sys
-    sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
-
-    app = VoltShiftApp()
-    app.mainloop()
-    # mainloop returns after _on_close calls quit(); now tear the tree down
-    # once, swallowing any residual CTk teardown noise since we are exiting.
+    app = AMDGPUTunerApp()
     try:
+        app.mainloop()
+    finally:
+        if not app._closing:
+            app.state_mgr.shutdown()
         app.destroy()
-    except Exception:
-        pass

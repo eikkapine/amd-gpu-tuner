@@ -1,4 +1,4 @@
-"""Base class for VoltShift GUI pages."""
+"""Base class for AMD GPU Tuner GUI pages."""
 
 from __future__ import annotations
 

@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amd-gpu-tuner"
+dynamic = ["version"]
+description = "AMD Radeon monitoring and tuning for Windows using the official ADLX SDK"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "eikkapine"}]
+dependencies = [
+  "customtkinter>=5.2,<7",
+  "psutil>=5.9,<8",
+  "pywin32>=306; sys_platform == 'win32'",
+  "numpy>=1.26,<3",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C++",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+build = ["pyinstaller>=6,<7"]
+
+[project.scripts]
+amd-gpu-tuner = "voltshift.cli:main"
+voltshift = "voltshift.cli:main"
+
+[project.gui-scripts]
+amd-gpu-tuner-gui = "voltshift.gui:run"
+
+[project.urls]
+Homepage = "https://github.com/eikkapine/amd-gpu-tuner"
+Issues = "https://github.com/eikkapine/amd-gpu-tuner/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "voltshift.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

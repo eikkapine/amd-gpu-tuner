@@ -35,7 +35,7 @@ class AutoTunePage(Page):
     # ── layout ───────────────────────────────────────────────────────────────
 
     def _build_goal_card(self) -> None:
-        card = Card(self, title="What should VoltShift optimise for?")
+        card = Card(self, title="What should AMD GPU Tuner optimise for?")
         card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         body = card.body()
 

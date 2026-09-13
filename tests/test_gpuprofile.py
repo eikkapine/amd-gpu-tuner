@@ -100,8 +100,12 @@ def test_ignored_knob_is_reported_unsupported(space):
 
 
 def test_clamped_knob_is_reported_unsupported(space):
-    applier = FakeApplier({VOLTAGE: 0, MAX_CLOCK: 0, VRAM_CLOCK: 2518, POWER_LIMIT: 0},
-                          clamp_to={POWER_LIMIT: -3})
+    class ClampedProbe(FakeApplier):
+        def apply(self, config, skip_unchanged=True):
+            if config.get(POWER_LIMIT) not in (None, 0):
+                config = {**config, POWER_LIMIT: -3}
+            return super().apply(config, skip_unchanged)
+    applier = ClampedProbe({VOLTAGE: 0, MAX_CLOCK: 0, VRAM_CLOCK: 2518, POWER_LIMIT: 0})
     check = verify_knob(applier, space.knob(POWER_LIMIT))
     assert not check.supported
     assert "clamped" in check.detail
@@ -202,3 +206,21 @@ def test_write_failure_is_reported_not_raised(space):
     check = verify_knob(Exploding({VOLTAGE: 0}), space.knob(VOLTAGE))
     assert not check.supported
     assert "write failed" in check.detail
+
+
+def test_failed_restore_aborts_verification_and_is_not_cached(space):
+    from voltshift.bridgeclient import BridgeError
+    class StuckProbe(FakeApplier):
+        def apply(self, config, skip_unchanged=True):
+            if self.writes and config.get(VOLTAGE) == 0:
+                return []  # driver silently ignores restoration
+            return super().apply(config, skip_unchanged)
+    applier = StuckProbe(space.default_config())
+    store = KnowledgeStore(":memory:")
+    try:
+        with pytest.raises(BridgeError, match="Restoration.*failed"):
+            verify_space(applier, space, store, "card-a")
+        assert store.knob_support("card-a") == {}
+        assert all(name == VOLTAGE for name, _ in applier.writes)
+    finally:
+        store.close()

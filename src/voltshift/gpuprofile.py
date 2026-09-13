@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from .bridgeclient import BridgeError
 from .optimizer.space import (MAX_CLOCK, MIN_CLOCK, POWER_LIMIT, VOLTAGE,
                               VRAM_CLOCK, SearchSpace)
 
@@ -44,7 +45,7 @@ ARCH_NOTES = {
         "Minimum-clock tuning is not exposed by this interface."
     ),
     "MGT2": (
-        "RDNA 2/3: GPU voltage is an absolute value. VoltShift converts "
+        "RDNA 2/3: GPU voltage is an absolute value. AMD GPU Tuner converts "
         "absolute targets to the deltas this interface expects."
     ),
     "MGT1": (
@@ -114,11 +115,19 @@ def verify_knob(applier, knob, log: Optional[Callable[[str, str], None]] = None
     except Exception as exc:
         return KnobCheck(knob.name, False, f"write failed ({exc})")
     finally:
-        # Always put it back, even if the read threw.
+        # A failed or silently ignored restore must stop the entire verification
+        # pass. It cannot be cached as "verified" while the probe remains live.
         try:
             applier.apply({knob.name: before}, skip_unchanged=False)
         except Exception:
-            pass
+            pass  # The readback below establishes whether it is already restored.
+        time.sleep(READBACK_DELAY_SEC)
+        try:
+            restored = applier.read_current().get(knob.name)
+        except Exception as exc:
+            raise BridgeError(f"Cannot verify restoration of {knob.name}; tuning stopped") from exc
+        if restored != before:
+            raise BridgeError(f"Restoration of {knob.name} failed: expected {before}, got {restored}; tuning stopped")
 
     if after is None:
         return KnobCheck(knob.name, False, "value disappeared after writing")

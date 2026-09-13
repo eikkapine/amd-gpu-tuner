@@ -26,6 +26,7 @@ const char* ResultStr(ADLX_RESULT r)
         case ADLX_GPU_IN_USE:        return "GPU_IN_USE";
         case ADLX_TIMEOUT_OPERATION: return "TIMEOUT_OPERATION";
         case ADLX_NOT_ACTIVE:        return "NOT_ACTIVE";
+        case ADLX_RESET_NEEDED:      return "RESET_NEEDED";
         default:                     return "UNKNOWN";
     }
 }
@@ -38,14 +39,19 @@ void Check(ADLX_RESULT res, const char* what)
 
 void Session::Initialize()
 {
+    if (m_initialized)
+        return;
     ADLX_RESULT res = m_helper.Initialize();
     if (ADLX_FAILED(res))
         throw BridgeError(std::string("ADLX init failed (") + ResultStr(res) +
                           "). Is the AMD Adrenalin driver installed?");
+    m_initialized = true;
     m_system = m_helper.GetSystemServices();
     if (!m_system)
+    {
+        Terminate();
         throw BridgeError("ADLX system services unavailable");
-    m_initialized = true;
+    }
 }
 
 void Session::Terminate()

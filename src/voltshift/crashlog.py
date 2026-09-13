@@ -143,7 +143,7 @@ def analyse_crash(telemetry: list[dict], volt_changes: list[dict],
     """Classify a crash from telemetry. Returns (reason_code, explanation)."""
     if not telemetry:
         return "NO_TELEMETRY", ("No telemetry was recorded before this crash. "
-                                "This can happen if VoltShift was killed immediately on driver reset.")
+                                "This can happen if AMD GPU Tuner was killed immediately on driver reset.")
 
     latest = telemetry[-1]
     clock = latest.get("clock_mhz", 0)
@@ -239,7 +239,7 @@ def _recommendations(code: str) -> list[str]:
         ],
         "THERMAL": [
             "1. Improve case airflow.",
-            "2. Check the GPU fan curve (VoltShift Fans page or Adrenalin).",
+            "2. Check the GPU fan curve (AMD GPU Tuner Fans page or Adrenalin).",
             "3. Reapply thermal paste if the GPU is older.",
         ],
         "THERMAL_HOTSPOT": [
@@ -252,7 +252,7 @@ def _recommendations(code: str) -> list[str]:
             "3. Run AMD Adrenalin diagnostics and check for driver updates.",
         ],
         "NO_TELEMETRY": [
-            "1. Ensure VoltShift was running and monitoring when the crash occurred.",
+            "1. Ensure AMD GPU Tuner was running and monitoring when the crash occurred.",
             "2. The crash may have happened too quickly for any telemetry to be saved.",
         ],
     }
@@ -551,7 +551,7 @@ class CrashLogger:
                             key=lambda x: x.get("clock_mhz", 0), reverse=True))
         header = (
             f"\n{'─' * 72}\n"
-            f"  VoltShift session started  {ts}\n"
+            f"  AMD GPU Tuner session started  {ts}\n"
             f"  GPU     : {gpu_name}\n"
             f"  Config  : poll={config.get('poll_interval_sec')}s  "
             f"hyst={config.get('hysteresis_count')}  "
@@ -564,7 +564,7 @@ class CrashLogger:
 
     def write_session_footer(self, crash_count: int) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        footer = (f"  VoltShift session ended  {ts}  —  {crash_count} crash(es) recorded\n"
+        footer = (f"  AMD GPU Tuner session ended  {ts}  —  {crash_count} crash(es) recorded\n"
                   f"{'─' * 72}\n")
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(footer)

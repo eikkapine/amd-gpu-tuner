@@ -4,7 +4,7 @@ project(voltshift_bridge CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(VOLTSHIFT_BRIDGE_VERSION "2.0.0")
+set(VOLTSHIFT_BRIDGE_VERSION "2.1.0")
 
 # ---------------------------------------------------------------------------
 # ADLX SDK location. The SDK provides headers only; the runtime

@@ -51,6 +51,35 @@ def test_space_skips_degenerate_ranges():
     assert POWER_LIMIT not in SearchSpace.from_tuning(tuning).names
 
 
+@pytest.mark.parametrize("rng", [
+    {"min": 10, "max": 0}, {"min": 0, "max": 10, "step": 0},
+    {"min": 0, "max": 10, "step": -2}, {"min": 0, "max": float("inf")},
+    {"min": None, "max": 10}, {"min": 0, "max": 10, "step": 20},
+])
+def test_space_rejects_invalid_driver_ranges(rng):
+    assert not SearchSpace.from_tuning({"power": {"powerLimitRange": rng}})
+
+
+def test_knob_snaps_relative_to_driver_minimum():
+    from voltshift.optimizer.space import Knob
+
+    knob = Knob("test", low=503, high=599, step=10)
+    assert knob.clamp(510) == 513
+    assert knob.clamp(999) == 593
+    assert knob.clamp(0) == 503
+    assert all((knob.clamp(v) - knob.low) % knob.step == 0 for v in range(490, 610))
+
+
+def test_lost_frame_source_cannot_create_a_false_efficiency_gain():
+    baseline = _window(fps=100.0)
+    candidate = WindowStats.from_samples([
+        Sample(t=float(i), board_w=250, hotspot_c=70, clock_mhz=2900,
+               gpu_util_pct=98) for i in range(6)])
+    score = score_trial([candidate], [baseline], "efficiency")
+    assert score.value == 0
+    assert score.note == "no comparable measurement"
+
+
 def test_vector_round_trip_is_stable(space):
     config = {VOLTAGE: -120, MAX_CLOCK: 3000, "min_clock_mhz": 800,
               "vram_max_mhz": 2600, POWER_LIMIT: 5}

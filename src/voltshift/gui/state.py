@@ -5,14 +5,14 @@ voltage engine runner, the crash logger, and the app-boost watcher. Pages
 read and mutate through here so there is one source of truth and one daemon.
 
 Thread marshalling: the engine/crash/boost callbacks fire on worker threads;
-`post` hops them onto the Tk main loop via `after` so pages can update
-widgets safely.
+`post` queues them for a main-thread drain so workers never block on Tk.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import queue
 from typing import Callable, Optional
 
 from .. import autostack, paths
@@ -28,6 +28,8 @@ class AppState:
     def __init__(self, tk_root):
         self._root = tk_root
         self._closing = False
+        self._post_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._post_job = self._root.after(25, self._drain_posts)
         self.bridge = BridgeClient()
         self.info: dict = {}
         self.caps: dict = {}
@@ -47,6 +49,8 @@ class AppState:
         self.governor = None
         self.goal = DEFAULT_GOAL
         self.recovery_notice: Optional[str] = None
+        self._recovery_checked = False
+        self.always_on_top = False
         # Frame-rate aware tuning installs itself on first run. Persisted so a
         # user who turns it off is not asked again by a later launch.
         self.auto_fetch_frames = True
@@ -60,13 +64,31 @@ class AppState:
     # ── thread marshalling ───────────────────────────────────────────────────
 
     def post(self, fn: Callable, *args) -> None:
-        """Run fn(*args) on the Tk main loop."""
+        """Queue work without calling Tk from a worker thread.
+
+        Tk's after() can block a worker until the UI handles its request.
+        That deadlocks when the UI is joining that worker during shutdown.
+        Only the main-thread drain below calls Tk.
+        """
+        if self._closing:
+            return
+        self._post_queue.put((fn, args))
+
+    def _drain_posts(self) -> None:
+        self._post_job = None
         if self._closing:
             return
         try:
-            self._root.after(0, lambda: fn(*args))
-        except RuntimeError:
-            pass  # window torn down
+            # Bound each batch so sustained telemetry cannot starve UI input.
+            for _ in range(100):
+                try:
+                    fn, args = self._post_queue.get_nowait()
+                except queue.Empty:
+                    break
+                fn(*args)
+        finally:
+            if not self._closing:
+                self._post_job = self._root.after(25, self._drain_posts)
 
     def log(self, msg: str, level: str = "info") -> None:
         def deliver() -> None:
@@ -96,16 +118,12 @@ class AppState:
     def _build_stack(self) -> None:
         """Wire telemetry, optimiser and safety, then start the one poller.
 
-        Recovery runs before anything else touches the GPU: if the previous
-        session died mid-change, the machine goes back to a known-good state
-        before the user can start another experiment on top of it.
+        Opening the app is passive. Recovery and control verification run
+        only when the user explicitly starts an automatic tuning controller.
         """
         try:
             self.stack = autostack.build(self.bridge, on_log=self.log,
                                          auto_fetch_frames=self.auto_fetch_frames)
-            self.recovery_notice = autostack.recover_previous_session(self.stack)
-            if self.recovery_notice:
-                self.log(self.recovery_notice, "error")
             self.stack.hub.subscribe(self._dispatch_hub_sample)
             self.stack.hub.start()
             self.log(f"telemetry — {self.stack.frame_source_status}")
@@ -194,6 +212,7 @@ class AppState:
             self.auto_fetch_frames = bool(
                 telemetry.get("auto_fetch_presentmon", True))
             self.goal = data.get("goal", self.goal)
+            self.always_on_top = bool(data.get("window", {}).get("always_on_top", False))
         except (OSError, ValueError):
             pass
 
@@ -201,6 +220,7 @@ class AppState:
         data = {"engine": self.engine_config.to_dict(),
                 "boost": self.boost_config.to_dict(),
                 "goal": self.goal,
+                "window": {"always_on_top": self.always_on_top},
                 "telemetry": {"auto_fetch_presentmon": self.auto_fetch_frames}}
         tmp = paths.config_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -218,13 +238,22 @@ class AppState:
         """
         if self.stack is None:
             return False
+        if not self._recovery_checked:
+            try:
+                self.recovery_notice = autostack.recover_previous_session(self.stack)
+                self._recovery_checked = True
+                if self.recovery_notice:
+                    self.log(self.recovery_notice, "warn")
+            except Exception as exc:
+                self.log(f"recovery failed; automatic tuning was not started: {exc}", "error")
+                return False
         if self.stack.verified and not force:
             return self.stack.tunable
         try:
             self.stack.verify_controls(force=force, on_log=self.log)
         except Exception as exc:
             self.log(f"control verification failed: {exc}", "error")
-            return self.stack.tunable
+            return False
         if not self.stack.tunable:
             self.log("none of this GPU's advertised tuning controls respond "
                      "to writes", "error")
@@ -295,6 +324,14 @@ class AppState:
 
     def shutdown(self) -> None:
         self._closing = True
+        if self._post_job is not None:
+            try:
+                self._root.after_cancel(self._post_job)
+            except Exception:
+                pass  # the window may already be destroyed; still stop workers
+            self._post_job = None
+        while not self._post_queue.empty():
+            self._post_queue.get_nowait()
         # Order matters: stop anything that writes to the GPU before the
         # bridge goes away, so every restore path can still reach the driver.
         for stop in (self.stop_autotune, self.stop_governor,

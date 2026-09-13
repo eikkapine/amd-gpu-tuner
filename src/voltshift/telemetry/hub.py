@@ -119,10 +119,17 @@ class TelemetryHub:
             self.consecutive_errors = 0
         except BridgeError as exc:
             self.consecutive_errors += 1
+            self._latest = None
             if self.on_error:
                 self.on_error(str(exc))
             return None
-        frames = self._frames.stats(self._frame_window)
+        try:
+            frames = self._frames.stats(self._frame_window)
+        except Exception as exc:
+            # Optional frame capture must never stop GPU safety telemetry.
+            frames = None
+            if self.on_error:
+                self.on_error(f"frame source unavailable: {exc}")
         sample = Sample.from_metrics(metrics, time.monotonic(), frames,
                                      self._applied_offset_mv)
         self._publish(sample)

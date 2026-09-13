@@ -9,6 +9,7 @@ daemon without interleaving.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import threading
@@ -24,9 +25,9 @@ class BridgeError(RuntimeError):
 class BridgeClient:
     def __init__(self, exe_path: Optional[str] = None, start_timeout: float = 15.0):
         self._exe = exe_path or paths.bridge_path()
-        self._start_timeout = start_timeout
+        self._start_timeout = self._validate_timeout(start_timeout)
         self._proc: Optional[subprocess.Popen] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._next_id = 0
         self.version: Optional[str] = None
 
@@ -34,51 +35,74 @@ class BridgeClient:
 
     @property
     def running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+        with self._lock:
+            return self._proc is not None and self._proc.poll() is None
 
     def start(self) -> None:
+        with self._lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
         if self.running:
             return
+        self._stop_locked(graceful=False)
         if not os.path.isfile(self._exe):
             raise BridgeError(
                 f"Bridge not found: {self._exe}\n"
                 "Build it first — see the README build guide."
             )
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        self._proc = subprocess.Popen(
-            [self._exe],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            creationflags=creationflags,
-        )
-        ready = self._read_line(timeout=self._start_timeout)
-        if ready.get("event") != "ready":
-            error = ready.get("error", "no ready handshake")
-            self.stop()
-            raise BridgeError(f"Bridge failed to start: {error}")
-        self.version = ready.get("version")
+        try:
+            self._proc = subprocess.Popen(
+                [self._exe],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+                creationflags=creationflags,
+            )
+            ready = self._read_line(timeout=self._start_timeout)
+            if ready.get("event") != "ready":
+                raise BridgeError(
+                    f"Bridge failed to start: {ready.get('error', 'no ready handshake')}"
+                )
+            self.version = ready.get("version")
+        except (OSError, BridgeError) as exc:
+            self._stop_locked(graceful=False)
+            if isinstance(exc, BridgeError):
+                raise
+            raise BridgeError(f"Bridge failed to start: {exc}") from exc
 
     def stop(self) -> None:
+        with self._lock:
+            self._stop_locked(graceful=True)
+
+    def _stop_locked(self, *, graceful: bool) -> None:
         proc, self._proc = self._proc, None
+        self.version = None
         if proc is None:
             return
         try:
-            if proc.poll() is None:
+            if graceful and proc.poll() is None:
                 proc.stdin.write(json.dumps({"id": -1, "cmd": "quit"}) + "\n")
                 proc.stdin.flush()
                 proc.wait(timeout=3)
-        except Exception:
-            proc.kill()
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
         finally:
-            try:
-                proc.stdin.close()
-                proc.stdout.close()
-            except Exception:
-                pass
+            if proc.poll() is None:
+                proc.kill()
+            # Reap the child before closing stdout, which may still have a
+            # reader blocked on it after a timeout.
+            proc.wait()
+            for pipe in (proc.stdin, proc.stdout):
+                try:
+                    if pipe is not None:
+                        pipe.close()
+                except (OSError, ValueError):
+                    pass
 
     def __enter__(self) -> "BridgeClient":
         self.start()
@@ -91,44 +115,78 @@ class BridgeClient:
 
     def call(self, cmd: str, args: Optional[dict] = None, timeout: float = 10.0) -> dict:
         """Run one command; returns the data payload or raises BridgeError."""
+        timeout = self._validate_timeout(timeout)
+        if not isinstance(cmd, str) or not cmd:
+            raise BridgeError("Bridge command must be a non-empty string")
+        if args is not None and not isinstance(args, dict):
+            raise BridgeError("Bridge arguments must be an object")
         with self._lock:
             if not self.running:
                 self.start()
             self._next_id += 1
             request = {"id": self._next_id, "cmd": cmd, "args": args or {}}
             try:
-                self._proc.stdin.write(json.dumps(request) + "\n")
+                encoded = json.dumps(request, allow_nan=False) + "\n"
+            except (TypeError, ValueError) as exc:
+                raise BridgeError(f"Invalid bridge arguments: {exc}") from exc
+            try:
+                self._proc.stdin.write(encoded)
                 self._proc.stdin.flush()
-            except OSError as exc:
-                self._proc = None
+            except (OSError, ValueError) as exc:
+                self._stop_locked(graceful=False)
                 raise BridgeError(f"Bridge pipe broken: {exc}") from exc
 
-            response = self._read_line(timeout=timeout)
-            if response.get("id") != self._next_id:
-                self.stop()
-                raise BridgeError("Bridge protocol desync (unexpected response id)")
-            if not response.get("ok"):
-                raise BridgeError(response.get("error", "unknown bridge error"))
+            try:
+                response = self._read_line(timeout=timeout)
+                if type(response.get("id")) is not int or response["id"] != self._next_id:
+                    raise BridgeError("Bridge protocol desync (unexpected response id)")
+                if type(response.get("ok")) is not bool:
+                    raise BridgeError("Invalid bridge response (missing boolean ok)")
+                if response["ok"] and not isinstance(response.get("data", {}), dict):
+                    raise BridgeError("Invalid bridge response (data must be an object)")
+            except BridgeError:
+                # Never reuse a stream after a timeout, parse failure, or
+                # mismatched response, and never retry a possibly applied write.
+                self._stop_locked(graceful=False)
+                raise
+            if not response["ok"]:
+                raise BridgeError(str(response.get("error", "unknown bridge error")))
             return response.get("data", {})
+
+    @staticmethod
+    def _validate_timeout(timeout: float) -> float:
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise BridgeError("Bridge timeout must be a finite positive number")
+        return float(timeout)
 
     def _read_line(self, timeout: float) -> dict:
         result: dict[str, Any] = {}
+        # Capture this pipe before starting the thread. A later restart must
+        # never let an old reader consume the new daemon's ready event.
+        stdout = self._proc.stdout
 
         def reader() -> None:
             try:
-                line = self._proc.stdout.readline()
-                if line:
-                    result.update(json.loads(line))
-            except Exception as exc:  # surfaced below as timeout/broken pipe
-                result["error"] = str(exc)
+                line = stdout.readline()
+                if not line:
+                    raise BridgeError("Bridge closed its output pipe")
+                parsed = json.loads(line)
+                if not isinstance(parsed, dict):
+                    raise BridgeError("Invalid bridge response (expected a JSON object)")
+                result["response"] = parsed
+            except (OSError, ValueError, BridgeError) as exc:
+                result["error"] = exc
 
-        t = threading.Thread(target=reader, daemon=True)
+        t = threading.Thread(target=reader, daemon=True, name="bridge-response")
         t.start()
         t.join(timeout)
-        if t.is_alive() or not result:
-            self.stop()
+        if t.is_alive():
+            self._stop_locked(graceful=False)
+            t.join(timeout=1)
             raise BridgeError("Bridge did not respond (timed out)")
-        return result
+        if "error" in result:
+            raise BridgeError(f"Bridge response failed: {result['error']}") from result["error"]
+        return result["response"]
 
     # ── convenience wrappers ─────────────────────────────────────────────────
 

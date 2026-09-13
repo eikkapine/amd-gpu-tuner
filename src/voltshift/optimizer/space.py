@@ -16,6 +16,7 @@ the applier does.
 from __future__ import annotations
 
 import random
+import math
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -53,8 +54,10 @@ class Knob:
         return max(1, self.high - self.low)
 
     def clamp(self, value: float) -> int:
-        snapped = round(value / self.step) * self.step if self.step > 1 else round(value)
-        return int(max(self.low, min(self.high, snapped)))
+        step = max(1, self.step)
+        index = max(0, min((self.high - self.low) // step,
+                           round((value - self.low) / step)))
+        return int(self.low + index * step)
 
     def normalise(self, value: float) -> float:
         return (float(value) - self.low) / self.span
@@ -69,7 +72,11 @@ def _range_of(section: dict, key: str) -> Optional[dict]:
         return None
     if "min" not in value or "max" not in value:
         return None
-    if value["min"] == value["max"]:
+    low, high, step = value["min"], value["max"], value.get("step", 1)
+    if any(not isinstance(v, (int, float)) or isinstance(v, bool)
+           or not math.isfinite(v) or int(v) != v for v in (low, high, step)):
+        return None
+    if low >= high or step <= 0 or high - low < step:
         return None
     return value
 

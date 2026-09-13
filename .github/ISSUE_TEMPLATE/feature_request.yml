@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest an improvement or a supported ADLX control.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the workflow and what currently makes it difficult.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain what the user would do and what would happen.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Hardware, references and alternatives
+      description: Include the GPU/driver and relevant official ADLX documentation when requesting a hardware control. Links to other tools are useful context, but do not establish AMD support.

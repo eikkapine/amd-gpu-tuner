@@ -94,10 +94,12 @@ class Watchdog:
 
     # ── startup recovery ─────────────────────────────────────────────────────
 
-    def check_previous_session(self) -> Optional[RecoveryReport]:
+    def check_previous_session(self, clear: bool = True) -> Optional[RecoveryReport]:
         """Detect a journal left unverified by a session that never returned."""
         entry = _read_json(_journal_path())
-        if not entry or entry.get("verified"):
+        if not isinstance(entry, dict) or not entry or entry.get("verified"):
+            return None
+        if not isinstance(entry.get("config"), dict):
             return None
         report = RecoveryReport(
             config=entry.get("config", {}),
@@ -106,7 +108,8 @@ class Watchdog:
             session_id=entry.get("session", ""),
             known_good=self.known_good(),
         )
-        self.clear()
+        if clear:
+            self.clear()
         self._log(report.summary(), "error")
         return report
 
@@ -167,7 +170,8 @@ class Watchdog:
 
     def known_good(self) -> Optional[dict]:
         entry = _read_json(_known_good_path())
-        return entry.get("config") if entry else None
+        config = entry.get("config") if isinstance(entry, dict) else None
+        return config if isinstance(config, dict) else None
 
     def set_known_good(self, config: dict) -> None:
         """Record a config as proven without going through probation.
@@ -200,7 +204,11 @@ class GuardedApply:
 
     def __enter__(self) -> "GuardedApply":
         self._watchdog.journal(self._config, self._reason)
-        self._apply(self._config)
+        try:
+            self._apply(self._config)
+        except Exception:
+            self.revert()
+            raise
         self.applied = True
         return self
 
@@ -211,8 +219,6 @@ class GuardedApply:
         return False
 
     def revert(self) -> None:
-        try:
-            self._apply(self._revert_to)
-        finally:
-            self._watchdog.abandon()
-            self.applied = False
+        self._apply(self._revert_to)
+        self._watchdog.abandon()
+        self.applied = False

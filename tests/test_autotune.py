@@ -180,7 +180,7 @@ def test_aborting_restores_the_baseline():
 
 def test_session_without_telemetry_fails_cleanly():
     space = SearchSpace.from_tuning(TUNING)
-    applier = RecordingApplier({VOLTAGE: 0})
+    applier = RecordingApplier(space.default_config())
 
     class DeadHub:
         def subscribe(self, callback):
@@ -200,6 +200,23 @@ def test_session_without_telemetry_fails_cleanly():
     report = _run(session)
     assert report.state == SessionState.FAILED
     assert "telemetry" in report.message
+
+
+def test_stop_during_final_apply_restores_baseline(monkeypatch):
+    session, applier, _, _ = _build(goal="efficiency")
+    apply = applier.apply
+
+    def stopping_apply(config, **kwargs):
+        result = apply(config, **kwargs)
+        if session.state == SessionState.APPLYING:
+            session._stop.set()
+        return result
+
+    monkeypatch.setattr(applier, "apply", stopping_apply)
+    report = _run(session)
+    assert report.state == SessionState.ABORTED
+    assert report.best_config is None
+    assert applier.current == session.baseline
 
 
 def test_knowledge_is_written_and_reused():

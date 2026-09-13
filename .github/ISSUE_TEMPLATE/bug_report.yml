@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible problem with AMD GPU Tuner.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the actual behavior and the expected result. For security-sensitive reports, follow SECURITY.md instead of posting details here.
+  - type: input
+    id: version
+    attributes:
+      label: Application version
+      description: Run amd-gpu-tuner --version, or check About.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: GPU, AMD driver version and Windows version
+      placeholder: "GPU model; Adrenalin version; Windows version"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the page, command, setting and any active tuning mode.
+      placeholder: |
+        1. Open ...
+        2. Apply ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual behavior
+      description: Include the exact error message when available.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics and screenshots
+      description: Run amd-gpu-tuner diagnostics --output diagnostics.json. Review the file for device identifiers and private paths before attaching it. Include relevant log excerpts or an actual screenshot if helpful.
+  - type: textarea
+    id: recovery
+    attributes:
+      label: Recovery or workaround
+      description: If a setting failed, explain whether stopping or resetting restored the previous behavior. Do not repeat a destabilizing change just to fill in this field.

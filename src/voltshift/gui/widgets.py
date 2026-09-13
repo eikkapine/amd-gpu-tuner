@@ -1,4 +1,4 @@
-"""Reusable CustomTkinter building blocks for VoltShift pages.
+"""Reusable CustomTkinter building blocks for AMD GPU Tuner pages.
 
 Each widget is small and self-contained: a card, a stat tile, a section
 header, a toggle row, a labeled slider, a segmented choice, and a scrolling
@@ -113,10 +113,15 @@ class LabeledSlider(ctk.CTkFrame):
         self._unit = unit
         self._command = command
         self._releasing = False
+        self._supported = True
+        self._minimum = from_
+        self._maximum = to
+        self._step = max(1, step)
+        self._current_value = from_
 
-        self._name = ctk.CTkLabel(self, text=label, anchor="w", font=(theme.FONT, 12),
+        self._name_label = ctk.CTkLabel(self, text=label, anchor="w", font=(theme.FONT, 12),
                                   text_color=theme.TEXT, width=120)
-        self._name.grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
+        self._name_label.grid(row=0, column=0, sticky="w", padx=(0, 10), pady=6)
 
         steps = max(1, int((to - from_) / step)) if to > from_ else 1
         self._slider = ctk.CTkSlider(self, from_=from_, to=to, number_of_steps=steps,
@@ -133,27 +138,43 @@ class LabeledSlider(ctk.CTkFrame):
         return f"{value}{(' ' + self._unit) if self._unit else ''}"
 
     def _on_move(self, value: float) -> None:
-        self._value.configure(text=self._fmt(int(round(value))))
+        if not self._supported:
+            return
+        self._current_value = min(self._maximum, max(self._minimum,
+            self._minimum + round((value - self._minimum) / self._step) * self._step))
+        self._value.configure(text=self._fmt(self._current_value))
 
     def _on_release(self, _event) -> None:
-        if self._command:
-            self._command(int(round(self._slider.get())))
+        if self._supported and self._command:
+            self._command(self.get())
 
     def set(self, value: int) -> None:
         self._slider.set(value)
+        # Keep the exact readback until the user moves the thumb. The driver
+        # can report a current value between its advertised slider steps.
+        self._current_value = int(value)
         self._value.configure(text=self._fmt(int(value)))
 
     def get(self) -> int:
-        return int(round(self._slider.get()))
+        return self._current_value
 
     def configure_range(self, from_: int, to: int, step: int = 1) -> None:
-        steps = max(1, int((to - from_) / step)) if to > from_ else 1
-        self._slider.configure(from_=from_, to=to, number_of_steps=steps)
+        self._minimum = int(from_)
+        self._step = max(1, int(step))
+        steps = max(0, int((to - from_) // self._step))
+        self._maximum = self._minimum + steps * self._step
+        self._slider.configure(from_=self._minimum,
+                               to=self._maximum if steps else self._minimum + 1,
+                               number_of_steps=max(1, steps))
 
     def set_supported(self, supported: bool) -> None:
         state = "normal" if supported else "disabled"
-        self._slider.configure(state=state)
-        self._name.configure(text_color=theme.TEXT if supported else theme.TEXT_FAINT)
+        self._supported = supported
+        self._slider.configure(state=state,
+                               progress_color=theme.ACCENT if supported else theme.BORDER,
+                               button_color=theme.ACCENT if supported else theme.TEXT_FAINT)
+        self._name_label.configure(text_color=theme.TEXT if supported else theme.TEXT_FAINT)
+        self._value.configure(text_color=theme.ACCENT if supported else theme.TEXT_FAINT)
 
 
 class ChoiceRow(ctk.CTkFrame):

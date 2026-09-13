@@ -1,4 +1,4 @@
-"""VoltShift — dynamic voltage control and full tuning suite for AMD Radeon GPUs."""
+"""AMD GPU Tuner — monitoring and tuning for AMD Radeon GPUs."""
 
-APP_NAME = "VoltShift"
-__version__ = "2.0.0"
+APP_NAME = "AMD GPU Tuner"
+__version__ = "2.1.0"

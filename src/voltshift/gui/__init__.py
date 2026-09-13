@@ -1,4 +1,4 @@
-"""VoltShift GUI package (CustomTkinter)."""
+"""AMD GPU Tuner GUI package (CustomTkinter)."""
 
 from .app import run
 

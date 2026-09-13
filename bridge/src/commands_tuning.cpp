@@ -5,9 +5,12 @@
 //   MGT2:           SetGPUVoltage takes an absolute value; offset is applied
 //                   relative to the current value.
 //   MGT1 (RDNA2/3): per-point VF curve; the offset is added to every point.
-// Safety: positive offsets are rejected, every write is clamped to the
-// ADLX-reported hardware range.
+// Safety: positive offsets and values outside the ADLX-reported range/step
+// are rejected. A failed range query must never become an unbounded write.
 #include "rpc.h"
+
+#include <cstdint>
+#include <limits>
 
 #include "SDK/Include/IGPUManualGFXTuning.h"
 #include "SDK/Include/IGPUManualVRAMTuning.h"
@@ -25,21 +28,36 @@ json RangeJson(const ADLX_IntRange& r)
     return {{"min", r.minValue}, {"max", r.maxValue}, {"step", r.step}};
 }
 
-adlx_int Clamp(adlx_int value, const ADLX_IntRange& r)
+adlx_int IntegerArg(const json& args, const char* name)
 {
-    // An all-zero range means the driver gave us nothing to clamp against.
-    if (r.minValue == 0 && r.maxValue == 0)
-        return value;
-    if (value < r.minValue) return r.minValue;
-    if (value > r.maxValue) return r.maxValue;
-    return value;
+    const json& value = args.at(name);
+    if (!value.is_number_integer() ||
+        (value.is_number_unsigned() && value.get<std::uint64_t>() >
+            static_cast<std::uint64_t>(std::numeric_limits<adlx_int>::max())))
+        throw BridgeError(std::string(name) + " must be a 32-bit integer");
+    auto number = value.get<std::int64_t>();
+    if (number < std::numeric_limits<adlx_int>::min() ||
+        number > std::numeric_limits<adlx_int>::max())
+        throw BridgeError(std::string(name) + " must be a 32-bit integer");
+    return static_cast<adlx_int>(number);
+}
+
+adlx_int ValidateValue(std::int64_t value, const ADLX_IntRange& r, const char* name)
+{
+    if (r.minValue > r.maxValue || r.step <= 0)
+        throw BridgeError(std::string(name) + ": driver returned an invalid tuning range");
+    if (value < r.minValue || value > r.maxValue || (value - r.minValue) % r.step != 0)
+        throw BridgeError(std::string(name) + " must be within " +
+            std::to_string(r.minValue) + ".." + std::to_string(r.maxValue) +
+            " in steps of " + std::to_string(r.step));
+    return static_cast<adlx_int>(value);
 }
 
 IADLXInterfacePtr ManualGfxIfc(Session& session, IADLXGPUPtr& gpu)
 {
     IADLXGPUTuningServicesPtr svc = session.TuningServices();
     adlx_bool supported = false;
-    svc->IsSupportedManualGFXTuning(gpu, &supported);
+    Check(svc->IsSupportedManualGFXTuning(gpu, &supported), "IsSupportedManualGFXTuning");
     if (!supported)
         throw BridgeError("Manual GFX tuning not supported on this GPU");
     IADLXInterfacePtr ifc;
@@ -51,7 +69,7 @@ IADLXManualFanTuningPtr FanIfc(Session& session, IADLXGPUPtr& gpu)
 {
     IADLXGPUTuningServicesPtr svc = session.TuningServices();
     adlx_bool supported = false;
-    svc->IsSupportedManualFanTuning(gpu, &supported);
+    Check(svc->IsSupportedManualFanTuning(gpu, &supported), "IsSupportedManualFanTuning");
     if (!supported)
         throw BridgeError("Manual fan tuning not supported on this GPU");
     IADLXInterfacePtr ifc;
@@ -66,7 +84,7 @@ IADLXManualPowerTuningPtr PowerIfc(Session& session, IADLXGPUPtr& gpu)
 {
     IADLXGPUTuningServicesPtr svc = session.TuningServices();
     adlx_bool supported = false;
-    svc->IsSupportedManualPowerTuning(gpu, &supported);
+    Check(svc->IsSupportedManualPowerTuning(gpu, &supported), "IsSupportedManualPowerTuning");
     if (!supported)
         throw BridgeError("Manual power tuning not supported on this GPU");
     IADLXInterfacePtr ifc;
@@ -82,7 +100,7 @@ IADLXManualVRAMTuning2Ptr VramIfc2(Session& session, IADLXGPUPtr& gpu)
 {
     IADLXGPUTuningServicesPtr svc = session.TuningServices();
     adlx_bool supported = false;
-    svc->IsSupportedManualVRAMTuning(gpu, &supported);
+    Check(svc->IsSupportedManualVRAMTuning(gpu, &supported), "IsSupportedManualVRAMTuning");
     if (!supported)
         throw BridgeError("Manual VRAM tuning not supported on this GPU");
     IADLXInterfacePtr ifc;
@@ -101,7 +119,7 @@ json CmdTuningGet(Session& session, const json&)
     json out = json::object();
 
     adlx_bool atFactory = false;
-    session.TuningServices()->IsAtFactory(gpu, &atFactory);
+    Check(session.TuningServices()->IsAtFactory(gpu, &atFactory), "IsAtFactory");
     out["atFactory"] = static_cast<bool>(atFactory);
 
     // GFX: voltage + core clocks.
@@ -119,26 +137,34 @@ json CmdTuningGet(Session& session, const json&)
         {
             adlx_int volt = 0, minF = 0, maxF = 0;
             ADLX_IntRange voltRange = {}, minFreqRange = {}, maxFreqRange = {};
-            mgt2->GetGPUVoltage(&volt);
-            mgt2->GetGPUMinFrequency(&minF);
-            mgt2->GetGPUMaxFrequency(&maxF);
-            mgt2->GetGPUVoltageRange(&voltRange);
-            mgt2->GetGPUMinFrequencyRange(&minFreqRange);
-            mgt2->GetGPUMaxFrequencyRange(&maxFreqRange);
+            Check(mgt2->GetGPUVoltage(&volt), "GetGPUVoltage");
+            Check(mgt2->GetGPUMaxFrequency(&maxF), "GetGPUMaxFrequency");
+            Check(mgt2->GetGPUVoltageRange(&voltRange), "GetGPUVoltageRange");
+            Check(mgt2->GetGPUMaxFrequencyRange(&maxFreqRange), "GetGPUMaxFrequencyRange");
             gfx["interface"] = mgt21 ? "MGT2_1" : "MGT2";
             gfx["voltageMv"] = volt;
-            gfx["minFreqMhz"] = minF;
             gfx["maxFreqMhz"] = maxF;
             gfx["voltageRange"] = RangeJson(voltRange);
-            gfx["minFreqRange"] = RangeJson(minFreqRange);
             gfx["maxFreqRange"] = RangeJson(maxFreqRange);
+            // RDNA4 drivers can expose no minimum-clock control. A failed
+            // optional getter must not hide valid voltage/max-clock controls.
+            const bool minSupported = ADLX_SUCCEEDED(mgt2->GetGPUMinFrequencyRange(&minFreqRange)) &&
+                minFreqRange.step > 0 && minFreqRange.minValue <= minFreqRange.maxValue &&
+                ADLX_SUCCEEDED(mgt2->GetGPUMinFrequency(&minF));
+            gfx["minFrequencySupported"] = minSupported;
+            if (minSupported)
+            {
+                gfx["minFreqMhz"] = minF;
+                gfx["minFreqRange"] = RangeJson(minFreqRange);
+            }
             if (mgt21)
             {
                 adlx_int dv = 0, dmin = 0, dmax = 0;
-                mgt21->GetGPUVoltageDefault(&dv);
-                mgt21->GetGPUMinFrequencyDefault(&dmin);
-                mgt21->GetGPUMaxFrequencyDefault(&dmax);
-                gfx["defaults"] = {{"voltageMv", dv}, {"minFreqMhz", dmin}, {"maxFreqMhz", dmax}};
+                json defaults = json::object();
+                if (ADLX_SUCCEEDED(mgt21->GetGPUVoltageDefault(&dv))) defaults["voltageMv"] = dv;
+                if (minSupported && ADLX_SUCCEEDED(mgt21->GetGPUMinFrequencyDefault(&dmin))) defaults["minFreqMhz"] = dmin;
+                if (ADLX_SUCCEEDED(mgt21->GetGPUMaxFrequencyDefault(&dmax))) defaults["maxFreqMhz"] = dmax;
+                gfx["defaults"] = defaults;
             }
         }
         else
@@ -157,8 +183,8 @@ json CmdTuningGet(Session& session, const json&)
                         if (ADLX_SUCCEEDED(states->At(i, &st)))
                         {
                             adlx_int freq = 0, volt = 0;
-                            st->GetFrequency(&freq);
-                            st->GetVoltage(&volt);
+                            Check(st->GetFrequency(&freq), "GetFrequency");
+                            Check(st->GetVoltage(&volt), "GetVoltage");
                             points.push_back({{"freqMhz", freq}, {"voltageMv", volt}});
                         }
                     }
@@ -184,8 +210,8 @@ json CmdTuningGet(Session& session, const json&)
 
         adlx_int freq = 0;
         ADLX_IntRange freqRange = {};
-        vram->GetMaxVRAMFrequency(&freq);
-        vram->GetMaxVRAMFrequencyRange(&freqRange);
+        Check(vram->GetMaxVRAMFrequency(&freq), "GetMaxVRAMFrequency");
+        Check(vram->GetMaxVRAMFrequencyRange(&freqRange), "GetMaxVRAMFrequencyRange");
         vj["maxFreqMhz"] = freq;
         vj["maxFreqRange"] = RangeJson(freqRange);
 
@@ -198,12 +224,12 @@ json CmdTuningGet(Session& session, const json&)
         }
 
         adlx_bool timingSupported = false;
-        vram->IsSupportedMemoryTiming(&timingSupported);
+        Check(vram->IsSupportedMemoryTiming(&timingSupported), "IsSupportedMemoryTiming");
         vj["timingSupported"] = static_cast<bool>(timingSupported);
         if (timingSupported)
         {
             ADLX_MEMORYTIMING_DESCRIPTION current = MEMORYTIMING_DEFAULT;
-            vram->GetMemoryTimingDescription(&current);
+            Check(vram->GetMemoryTimingDescription(&current), "GetMemoryTimingDescription");
             vj["timing"] = static_cast<int>(current);
 
             json available = json::array();
@@ -216,7 +242,7 @@ json CmdTuningGet(Session& session, const json&)
                     if (ADLX_SUCCEEDED(list->At(i, &desc)))
                     {
                         ADLX_MEMORYTIMING_DESCRIPTION d = MEMORYTIMING_DEFAULT;
-                        desc->GetDescription(&d);
+                        Check(desc->GetDescription(&d), "GetDescription");
                         available.push_back(static_cast<int>(d));
                     }
                 }
@@ -235,20 +261,20 @@ json CmdTuningGet(Session& session, const json&)
 
         adlx_int limit = 0;
         ADLX_IntRange limitRange = {};
-        power->GetPowerLimit(&limit);
-        power->GetPowerLimitRange(&limitRange);
+        Check(power->GetPowerLimit(&limit), "GetPowerLimit");
+        Check(power->GetPowerLimitRange(&limitRange), "GetPowerLimitRange");
         pj["powerLimit"] = limit;
         pj["powerLimitRange"] = RangeJson(limitRange);
 
         adlx_bool tdcSupported = false;
-        power->IsSupportedTDCLimit(&tdcSupported);
+        Check(power->IsSupportedTDCLimit(&tdcSupported), "IsSupportedTDCLimit");
         pj["tdcSupported"] = static_cast<bool>(tdcSupported);
         if (tdcSupported)
         {
             adlx_int tdc = 0;
             ADLX_IntRange tdcRange = {};
-            power->GetTDCLimit(&tdc);
-            power->GetTDCLimitRange(&tdcRange);
+            Check(power->GetTDCLimit(&tdc), "GetTDCLimit");
+            Check(power->GetTDCLimitRange(&tdcRange), "GetTDCLimitRange");
             pj["tdcLimit"] = tdc;
             pj["tdcRange"] = RangeJson(tdcRange);
         }
@@ -271,7 +297,7 @@ json CmdTuningGet(Session& session, const json&)
 
 json CmdSetVoltageOffset(Session& session, const json& args)
 {
-    adlx_int offsetMv = args.at("mv").get<adlx_int>();
+    adlx_int offsetMv = IntegerArg(args, "mv");
     if (offsetMv > 0)
         throw BridgeError("Positive voltage offsets are blocked for safety");
 
@@ -283,8 +309,12 @@ json CmdSetVoltageOffset(Session& session, const json& args)
     if (ADLX_SUCCEEDED(ifc->QueryInterface(IADLXManualGraphicsTuning2_1::IID(), reinterpret_cast<void**>(&mgt21))) && mgt21)
     {
         ADLX_IntRange range = {};
-        mgt21->GetGPUVoltageRange(&range);
-        adlx_int applied = Clamp(offsetMv, range);
+        Check(mgt21->GetGPUVoltageRange(&range), "GetGPUVoltageRange");
+        // Version 2_1 adds default getters; refuse to assume offset semantics
+        // if this driver advertises an absolute-voltage range.
+        if (range.minValue > 0)
+            throw BridgeError("Driver does not expose a voltage-offset range on MGT2_1");
+        adlx_int applied = ValidateValue(offsetMv, range, "Voltage offset");
         Check(mgt21->SetGPUVoltage(applied), "SetGPUVoltage(MGT2_1)");
         return {{"appliedMv", applied}, {"interface", "MGT2_1"}};
     }
@@ -294,10 +324,10 @@ json CmdSetVoltageOffset(Session& session, const json& args)
     if (ADLX_SUCCEEDED(ifc->QueryInterface(IADLXManualGraphicsTuning2::IID(), reinterpret_cast<void**>(&mgt2))) && mgt2)
     {
         adlx_int current = 0;
-        mgt2->GetGPUVoltage(&current);
+        Check(mgt2->GetGPUVoltage(&current), "GetGPUVoltage");
         ADLX_IntRange range = {};
-        mgt2->GetGPUVoltageRange(&range);
-        adlx_int applied = Clamp(current + offsetMv, range);
+        Check(mgt2->GetGPUVoltageRange(&range), "GetGPUVoltageRange");
+        adlx_int applied = ValidateValue(static_cast<std::int64_t>(current) + offsetMv, range, "Voltage");
         Check(mgt2->SetGPUVoltage(applied), "SetGPUVoltage(MGT2)");
         return {{"baseMv", current}, {"offsetMv", offsetMv}, {"appliedMv", applied}, {"interface", "MGT2"}};
     }
@@ -312,24 +342,29 @@ json CmdSetVoltageOffset(Session& session, const json& args)
     Check(mgt1->GetEmptyGPUTuningStates(&empty), "GetEmptyGPUTuningStates");
 
     ADLX_IntRange freqRange = {}, voltRange = {};
-    mgt1->GetGPUTuningRanges(&freqRange, &voltRange);
+    Check(mgt1->GetGPUTuningRanges(&freqRange, &voltRange), "GetGPUTuningRanges");
 
     adlx_uint count = current->End() - current->Begin();
+    if (count == 0 || count != empty->End() - empty->Begin())
+        throw BridgeError("Driver returned inconsistent GPU tuning states");
     for (adlx_uint i = 0; i < count; ++i)
     {
         IADLXManualTuningStatePtr src, dst;
-        if (ADLX_FAILED(current->At(i + current->Begin(), &src))) continue;
-        if (ADLX_FAILED(empty->At(i + empty->Begin(), &dst))) continue;
+        Check(current->At(i + current->Begin(), &src), "CurrentGPUStates::At");
+        Check(empty->At(i + empty->Begin(), &dst), "EmptyGPUStates::At");
 
         adlx_int freq = 0, volt = 0;
-        src->GetFrequency(&freq);
-        src->GetVoltage(&volt);
-        dst->SetFrequency(freq);
-        dst->SetVoltage(Clamp(volt + offsetMv, voltRange));
+        Check(src->GetFrequency(&freq), "GetFrequency");
+        Check(src->GetVoltage(&volt), "GetVoltage");
+        Check(dst->SetFrequency(freq), "SetFrequency");
+        Check(dst->SetVoltage(ValidateValue(static_cast<std::int64_t>(volt) + offsetMv,
+            voltRange, "VF point voltage")), "SetVoltage");
     }
 
     adlx_int errIdx = 0;
     Check(mgt1->IsValidGPUTuningStates(empty, &errIdx), "IsValidGPUTuningStates");
+    if (errIdx != -1)
+        throw BridgeError("Invalid GPU tuning state at point " + std::to_string(errIdx));
     Check(mgt1->SetGPUTuningStates(empty), "SetGPUTuningStates");
     return {{"offsetMv", offsetMv}, {"interface", "MGT1"}};
 }
@@ -338,6 +373,10 @@ json CmdSetVoltageOffset(Session& session, const json& args)
 
 json CmdSetCoreClocks(Session& session, const json& args)
 {
+    const bool setMin = args.contains("minMhz"), setMax = args.contains("maxMhz");
+    if (!setMin && !setMax)
+        throw BridgeError("setCoreClocks needs minMhz and/or maxMhz");
+
     IADLXGPUPtr gpu = session.Gpu();
     IADLXInterfacePtr ifc = ManualGfxIfc(session, gpu);
 
@@ -345,25 +384,55 @@ json CmdSetCoreClocks(Session& session, const json& args)
     if (ADLX_FAILED(ifc->QueryInterface(IADLXManualGraphicsTuning2::IID(), reinterpret_cast<void**>(&mgt2))) || !mgt2)
         throw BridgeError("Core clock control requires the MGT2 tuning interface");
 
+    ADLX_IntRange minRange = {}, maxRange = {};
+    Check(mgt2->GetGPUMaxFrequencyRange(&maxRange), "GetGPUMaxFrequencyRange");
+    adlx_int oldMin = 0, oldMax = 0;
+    Check(mgt2->GetGPUMaxFrequency(&oldMax), "GetGPUMaxFrequency");
+    const bool absoluteMax = maxRange.minValue > 0;
+    if (setMin)
+        Check(mgt2->GetGPUMinFrequencyRange(&minRange), "GetGPUMinFrequencyRange");
+    if (setMin || absoluteMax)
+        Check(mgt2->GetGPUMinFrequency(&oldMin), "GetGPUMinFrequency");
+    const adlx_int min = setMin ? ValidateValue(IntegerArg(args, "minMhz"), minRange, "Minimum clock") : oldMin;
+    const adlx_int max = setMax ? ValidateValue(IntegerArg(args, "maxMhz"), maxRange, "Maximum clock") : oldMax;
+
+    // Navi4+ exposes maximum frequency as an offset, whereas minimum
+    // frequency remains absolute. Compare them only for absolute ranges.
+    if (absoluteMax && min > max)
+        throw BridgeError("Minimum core clock must not exceed maximum core clock");
+    const bool maxFirst = absoluteMax && setMax && min > oldMax;
+    bool firstWritten = false;
+    try
+    {
+        if (maxFirst)
+        {
+            Check(mgt2->SetGPUMaxFrequency(max), "SetGPUMaxFrequency");
+            firstWritten = true;
+        }
+        if (setMin)
+        {
+            Check(mgt2->SetGPUMinFrequency(min), "SetGPUMinFrequency");
+            firstWritten = true;
+        }
+        if (setMax && !maxFirst)
+            Check(mgt2->SetGPUMaxFrequency(max), "SetGPUMaxFrequency");
+    }
+    catch (const BridgeError& error)
+    {
+        if (setMin && setMax && firstWritten)
+        {
+            // Undo in reverse order if the second write fails. Never reset
+            // unrelated voltage, VRAM, power, or fan settings as rollback.
+            ADLX_RESULT second = maxFirst ? mgt2->SetGPUMinFrequency(oldMin) : mgt2->SetGPUMaxFrequency(oldMax);
+            ADLX_RESULT first = maxFirst ? mgt2->SetGPUMaxFrequency(oldMax) : mgt2->SetGPUMinFrequency(oldMin);
+            if (ADLX_FAILED(first) || ADLX_FAILED(second))
+                throw BridgeError(std::string(error.what()) + "; clock rollback failed; tuning may be partially applied");
+        }
+        throw;
+    }
     json out = json::object();
-    if (args.contains("minMhz"))
-    {
-        ADLX_IntRange range = {};
-        mgt2->GetGPUMinFrequencyRange(&range);
-        adlx_int v = Clamp(args["minMhz"].get<adlx_int>(), range);
-        Check(mgt2->SetGPUMinFrequency(v), "SetGPUMinFrequency");
-        out["minMhz"] = v;
-    }
-    if (args.contains("maxMhz"))
-    {
-        ADLX_IntRange range = {};
-        mgt2->GetGPUMaxFrequencyRange(&range);
-        adlx_int v = Clamp(args["maxMhz"].get<adlx_int>(), range);
-        Check(mgt2->SetGPUMaxFrequency(v), "SetGPUMaxFrequency");
-        out["maxMhz"] = v;
-    }
-    if (out.empty())
-        throw BridgeError("setCoreClocks needs minMhz and/or maxMhz");
+    if (setMin) out["minMhz"] = min;
+    if (setMax) out["maxMhz"] = max;
     return out;
 }
 
@@ -375,8 +444,8 @@ json CmdSetVramMax(Session& session, const json& args)
     IADLXManualVRAMTuning2Ptr vram = VramIfc2(session, gpu);
 
     ADLX_IntRange range = {};
-    vram->GetMaxVRAMFrequencyRange(&range);
-    adlx_int v = Clamp(args.at("mhz").get<adlx_int>(), range);
+    Check(vram->GetMaxVRAMFrequencyRange(&range), "GetMaxVRAMFrequencyRange");
+    adlx_int v = ValidateValue(IntegerArg(args, "mhz"), range, "VRAM frequency");
     Check(vram->SetMaxVRAMFrequency(v), "SetMaxVRAMFrequency");
     return {{"appliedMhz", v}};
 }
@@ -389,11 +458,24 @@ json CmdSetMemoryTiming(Session& session, const json& args)
     IADLXManualVRAMTuning2Ptr vram = VramIfc2(session, gpu);
 
     adlx_bool supported = false;
-    vram->IsSupportedMemoryTiming(&supported);
+    Check(vram->IsSupportedMemoryTiming(&supported), "IsSupportedMemoryTiming");
     if (!supported)
         throw BridgeError("Memory timing not supported on this GPU");
 
-    int timing = args.at("timing").get<int>();
+    int timing = IntegerArg(args, "timing");
+    IADLXMemoryTimingDescriptionListPtr options;
+    Check(vram->GetSupportedMemoryTimingDescriptionList(&options), "GetSupportedMemoryTimingDescriptionList");
+    bool available = false;
+    for (adlx_uint i = options->Begin(); i != options->End(); ++i)
+    {
+        IADLXMemoryTimingDescriptionPtr option;
+        Check(options->At(i, &option), "MemoryTimingDescriptions::At");
+        ADLX_MEMORYTIMING_DESCRIPTION value = MEMORYTIMING_DEFAULT;
+        Check(option->GetDescription(&value), "GetDescription");
+        if (timing == static_cast<int>(value)) available = true;
+    }
+    if (!available)
+        throw BridgeError("Requested memory timing is not supported on this GPU");
     Check(vram->SetMemoryTimingDescription(static_cast<ADLX_MEMORYTIMING_DESCRIPTION>(timing)),
           "SetMemoryTimingDescription");
     return {{"applied", timing}};
@@ -407,8 +489,8 @@ json CmdSetPowerLimit(Session& session, const json& args)
     IADLXManualPowerTuningPtr power = PowerIfc(session, gpu);
 
     ADLX_IntRange range = {};
-    power->GetPowerLimitRange(&range);
-    adlx_int v = Clamp(args.at("pct").get<adlx_int>(), range);
+    Check(power->GetPowerLimitRange(&range), "GetPowerLimitRange");
+    adlx_int v = ValidateValue(IntegerArg(args, "pct"), range, "Power limit");
     Check(power->SetPowerLimit(v), "SetPowerLimit");
     return {{"applied", v}};
 }
@@ -419,13 +501,13 @@ json CmdSetTdc(Session& session, const json& args)
     IADLXManualPowerTuningPtr power = PowerIfc(session, gpu);
 
     adlx_bool supported = false;
-    power->IsSupportedTDCLimit(&supported);
+    Check(power->IsSupportedTDCLimit(&supported), "IsSupportedTDCLimit");
     if (!supported)
         throw BridgeError("TDC limit not supported on this GPU");
 
     ADLX_IntRange range = {};
-    power->GetTDCLimitRange(&range);
-    adlx_int v = Clamp(args.at("amps").get<adlx_int>(), range);
+    Check(power->GetTDCLimitRange(&range), "GetTDCLimitRange");
+    adlx_int v = ValidateValue(IntegerArg(args, "amps"), range, "TDC limit");
     Check(power->SetTDCLimit(v), "SetTDCLimit");
     return {{"applied", v}};
 }
@@ -453,45 +535,45 @@ json CmdGetFans(Session& session, const json&)
         if (ADLX_SUCCEEDED(states->At(i, &st)))
         {
             adlx_int speed = 0, temp = 0;
-            st->GetFanSpeed(&speed);
-            st->GetTemperature(&temp);
+            Check(st->GetFanSpeed(&speed), "GetFanSpeed");
+            Check(st->GetTemperature(&temp), "GetTemperature");
             curve.push_back({{"tempC", temp}, {"speedPct", speed}});
         }
     }
     out["curve"] = curve;
 
     adlx_bool zeroRpmSupported = false;
-    fan->IsSupportedZeroRPM(&zeroRpmSupported);
+    Check(fan->IsSupportedZeroRPM(&zeroRpmSupported), "IsSupportedZeroRPM");
     out["zeroRpmSupported"] = static_cast<bool>(zeroRpmSupported);
     if (zeroRpmSupported)
     {
         adlx_bool zeroRpm = false;
-        fan->GetZeroRPMState(&zeroRpm);
+        Check(fan->GetZeroRPMState(&zeroRpm), "GetZeroRPMState");
         out["zeroRpm"] = static_cast<bool>(zeroRpm);
     }
 
     adlx_bool targetSupported = false;
-    fan->IsSupportedTargetFanSpeed(&targetSupported);
+    Check(fan->IsSupportedTargetFanSpeed(&targetSupported), "IsSupportedTargetFanSpeed");
     out["targetFanSpeedSupported"] = static_cast<bool>(targetSupported);
     if (targetSupported)
     {
         adlx_int target = 0;
         ADLX_IntRange targetRange = {};
-        fan->GetTargetFanSpeed(&target);
-        fan->GetTargetFanSpeedRange(&targetRange);
+        Check(fan->GetTargetFanSpeed(&target), "GetTargetFanSpeed");
+        Check(fan->GetTargetFanSpeedRange(&targetRange), "GetTargetFanSpeedRange");
         out["targetFanSpeed"] = target;
         out["targetFanSpeedRange"] = RangeJson(targetRange);
     }
 
     adlx_bool minFanSupported = false;
-    fan->IsSupportedMinFanSpeed(&minFanSupported);
+    Check(fan->IsSupportedMinFanSpeed(&minFanSupported), "IsSupportedMinFanSpeed");
     out["minFanSpeedSupported"] = static_cast<bool>(minFanSupported);
     if (minFanSupported)
     {
         adlx_int minFan = 0;
         ADLX_IntRange minFanRange = {};
-        fan->GetMinFanSpeed(&minFan);
-        fan->GetMinFanSpeedRange(&minFanRange);
+        Check(fan->GetMinFanSpeed(&minFan), "GetMinFanSpeed");
+        Check(fan->GetMinFanSpeedRange(&minFanRange), "GetMinFanSpeedRange");
         out["minFanSpeed"] = minFan;
         out["minFanSpeedRange"] = RangeJson(minFanRange);
     }
@@ -525,16 +607,20 @@ json CmdSetFanCurve(Session& session, const json& args)
     {
         IADLXManualFanTuningStatePtr st;
         Check(states->At(i + states->Begin(), &st), "FanStates::At");
-        adlx_int temp = Clamp(curve[i].at("tempC").get<adlx_int>(), tempRange);
-        adlx_int speed = Clamp(curve[i].at("speedPct").get<adlx_int>(), speedRange);
-        st->SetTemperature(temp);
-        st->SetFanSpeed(speed);
+        adlx_int temp = ValidateValue(IntegerArg(curve[i], "tempC"), tempRange, "Fan temperature");
+        adlx_int speed = ValidateValue(IntegerArg(curve[i], "speedPct"), speedRange, "Fan speed");
+        if (i > 0 && (temp <= applied[i - 1]["tempC"].get<adlx_int>() ||
+                      speed < applied[i - 1]["speedPct"].get<adlx_int>()))
+            throw BridgeError("Fan temperatures must increase and fan speeds must not decrease");
+        Check(st->SetTemperature(temp), "SetTemperature");
+        Check(st->SetFanSpeed(speed), "SetFanSpeed");
         applied.push_back({{"tempC", temp}, {"speedPct", speed}});
     }
 
     adlx_int errIdx = 0;
-    Check(fan->IsValidFanTuningStates(states, &errIdx),
-          ("IsValidFanTuningStates(point " + std::to_string(errIdx) + ")").c_str());
+    Check(fan->IsValidFanTuningStates(states, &errIdx), "IsValidFanTuningStates");
+    if (errIdx != -1)
+        throw BridgeError("Invalid fan tuning state at point " + std::to_string(errIdx));
     Check(fan->SetFanTuningStates(states), "SetFanTuningStates");
     return {{"curve", applied}};
 }
@@ -547,7 +633,7 @@ json CmdSetZeroRpm(Session& session, const json& args)
     IADLXManualFanTuningPtr fan = FanIfc(session, gpu);
 
     adlx_bool supported = false;
-    fan->IsSupportedZeroRPM(&supported);
+    Check(fan->IsSupportedZeroRPM(&supported), "IsSupportedZeroRPM");
     if (!supported)
         throw BridgeError("ZeroRPM not supported on this GPU");
 

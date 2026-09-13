@@ -38,6 +38,10 @@ void Check(ADLX_RESULT res, const char* what);
 
 class Session {
 public:
+    ~Session() { Terminate(); }
+    Session() = default;
+    Session(const Session&) = delete;
+    Session& operator=(const Session&) = delete;
     // Throws BridgeError if the ADLX runtime is missing or refuses to load.
     void Initialize();
     void Terminate();

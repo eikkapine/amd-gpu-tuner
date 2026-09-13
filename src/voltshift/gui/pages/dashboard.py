@@ -14,10 +14,23 @@ class DashboardPage(Page):
 
     def build(self) -> None:
         self.grid_columnconfigure(0, weight=1)
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text="GPU overview", font=(theme.FONT, 23, "bold"),
+                     text_color=theme.TEXT, anchor="w").grid(row=0, column=0, sticky="w")
+        self._copy_button = ctk.CTkButton(header, text="Copy system summary", width=165,
+                                         fg_color=theme.SURFACE_2, hover_color=theme.SURFACE_3,
+                                         command=self._copy_summary)
+        self._copy_button.grid(row=0, column=1)
+        self._session_note = ctk.CTkLabel(self, text="", anchor="w", justify="left",
+                                          wraplength=760, font=(theme.FONT, 12),
+                                          text_color=theme.TEXT_DIM)
+        self._session_note.grid(row=1, column=0, sticky="ew", pady=(0, 14))
 
         # Stat tiles row.
         tiles = ctk.CTkFrame(self, fg_color="transparent")
-        tiles.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        tiles.grid(row=2, column=0, sticky="ew", pady=(0, 14))
         for i in range(4):
             tiles.grid_columnconfigure(i, weight=1)
 
@@ -35,7 +48,7 @@ class DashboardPage(Page):
 
         # Second tile row.
         tiles2 = ctk.CTkFrame(self, fg_color="transparent")
-        tiles2.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+        tiles2.grid(row=3, column=0, sticky="ew", pady=(0, 14))
         for i in range(4):
             tiles2.grid_columnconfigure(i, weight=1)
         specs2 = [
@@ -53,7 +66,7 @@ class DashboardPage(Page):
         # the row states plainly when it has nothing to show rather than
         # sitting there with four empty dashes.
         tiles3 = ctk.CTkFrame(self, fg_color="transparent")
-        tiles3.grid(row=2, column=0, sticky="ew", pady=(0, 14))
+        tiles3.grid(row=4, column=0, sticky="ew", pady=(0, 14))
         for i in range(4):
             tiles3.grid_columnconfigure(i, weight=1)
         specs3 = [
@@ -70,23 +83,23 @@ class DashboardPage(Page):
         self._frame_note = ctk.CTkLabel(
             self, text="", font=(theme.FONT, 11), text_color=theme.TEXT_FAINT,
             anchor="w", justify="left")
-        self._frame_note.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        self._frame_note.grid(row=5, column=0, sticky="ew", pady=(0, 10))
 
         # Graphs.
         clock_card = Card(self, title="Core clock")
-        clock_card.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+        clock_card.grid(row=6, column=0, sticky="ew", pady=(0, 12))
         self._clock_graph = ScrollGraph(clock_card.body(), height=190)
         self._clock_graph.add_series("clock", theme.GRAPH_CLOCK, 0, 3400)
         self._clock_graph.pack(fill="both", expand=True)
 
         frame_card = Card(self, title="Frametime")
-        frame_card.grid(row=5, column=0, sticky="ew", pady=(0, 12))
+        frame_card.grid(row=7, column=0, sticky="ew", pady=(0, 12))
         self._frame_graph = ScrollGraph(frame_card.body(), height=150)
         self._frame_graph.add_series("frametime", theme.GRAPH_VOLT, 0, 50)
         self._frame_graph.pack(fill="both", expand=True)
 
         dual = ctk.CTkFrame(self, fg_color="transparent")
-        dual.grid(row=6, column=0, sticky="ew")
+        dual.grid(row=8, column=0, sticky="ew")
         dual.grid_columnconfigure(0, weight=1)
         dual.grid_columnconfigure(1, weight=1)
 
@@ -105,11 +118,45 @@ class DashboardPage(Page):
 
         self.state.sample_sinks.append(self._on_sample)
 
+    def on_show(self) -> None:
+        self._update_session_note()
+
+    def _update_session_note(self) -> None:
+        if not self.state.connected:
+            self._session_note.configure(
+                text=f"Connection unavailable: {self.state.connect_error or 'GPU not detected'}. See Logs for details.",
+                text_color=theme.WARN)
+            self._copy_button.configure(state="disabled")
+            return
+        active = [name for attr, name in (("engine_running", "Dynamic Voltage"),
+                  ("autotune_running", "Auto-Tune"), ("governor_running", "Adaptive"),
+                  ("appboost_active", "App Boost")) if getattr(self.state, attr, False)]
+        if active:
+            text = "Active: " + ", ".join(active)
+        else:
+            text = "Monitoring only · Automatic tuning is stopped. Opening this dashboard does not change GPU settings."
+        self._session_note.configure(text=text, text_color=theme.GOOD if active else theme.TEXT_DIM)
+
+    def _copy_summary(self) -> None:
+        from ...diagnostics import collect_report, format_summary
+        try:
+            report = collect_report(self.state.bridge)
+            self.clipboard_clear()
+            self.clipboard_append(format_summary(report))
+            self._copy_button.configure(text="Summary copied")
+            self.after(2500, lambda: self._copy_button.configure(text="Copy system summary"))
+        except Exception as exc:
+            self._session_note.configure(text=f"Could not copy summary: {exc}", text_color=theme.WARN)
+            self.state.log(f"Copy system summary failed: {exc}", "error")
+
     def _on_sample(self, s: dict) -> None:
+        self._update_session_note()
         clock = s.get("clockMhz")
         temp = s.get("tempC")
         hotspot = s.get("hotspotC")
-        power = s.get("boardPowerW", s.get("powerW"))
+        power = s.get("boardPowerW")
+        if power is None:
+            power = s.get("powerW")
         voltage = s.get("voltageMv")
 
         self._tiles["clock"].set(clock)
@@ -131,8 +178,8 @@ class DashboardPage(Page):
 
         if fps is None:
             self._frame_note.configure(
-                text=("No frame data — run scripts/fetch_presentmon.ps1 (or start "
-                      "RTSS) to see frame rate, 1% lows and frames per watt."))
+                text=("Waiting for game frame data. Start a game with PresentMon or RTSS available "
+                      "to measure frame rate, frame pacing and efficiency."))
         else:
             self._frame_note.configure(
                 text=f"{s.get('frameProcess', 'unknown')} "

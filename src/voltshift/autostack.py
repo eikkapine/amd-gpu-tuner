@@ -123,7 +123,7 @@ def recover_previous_session(stack: AutoStack) -> Optional[str]:
     that configuration is recorded as unsafe for this card and the machine is
     put back to the last configuration that was proven good.
     """
-    report = stack.watchdog.check_previous_session()
+    report = stack.watchdog.check_previous_session(clear=False)
     if report is None:
         return None
 
@@ -132,13 +132,17 @@ def recover_previous_session(stack: AutoStack) -> Optional[str]:
 
     stack.knowledge.record_failure(stack.gpu_key, report.config.get(VOLTAGE), None)
 
+    restored = "factory tuning"
     if report.known_good:
         try:
             stack.applier.apply(report.known_good, skip_unchanged=False)
+            restored = "the last known-good configuration"
         except Exception:
             stack.applier.reset()
     else:
         stack.applier.reset()
 
+    stack.watchdog.abandon()
+
     return (f"{report.summary()} Restored "
-            f"{'the last known-good configuration' if report.known_good else 'factory tuning'}.")
+            f"{restored}.")

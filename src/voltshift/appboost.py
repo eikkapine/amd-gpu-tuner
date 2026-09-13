@@ -65,45 +65,57 @@ class AppBoostWatcher:
         self.config = config
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._lock = threading.RLock()
         self._boosted = False
+        self._restore_pending = False
         self._saved_power: Optional[int] = None
         self._saved_max_clock: Optional[int] = None
         self.on_log_entry: Optional[Callable[[str, str], None]] = None
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.on_log_entry:
-            self.on_log_entry(msg, level)
+            try:
+                self.on_log_entry(msg, level)
+            except Exception:
+                pass  # An observer must never prevent hardware restoration.
 
     @property
     def active(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return self._restore_pending or (self._thread is not None and self._thread.is_alive())
 
     @property
     def boosted(self) -> bool:
         return self._boosted
 
     def start(self) -> None:
-        if self.active:
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="voltshift-appboost",
-                                        daemon=True)
-        self._thread.start()
+        with self._lock:
+            if self.active:
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, name="voltshift-appboost",
+                                            daemon=True)
+            self._thread.start()
         self._log(f"App boost watching: {', '.join(self.config.apps) or '(no apps)'}")
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread:
+        if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=self.config.poll_interval_sec + 2)
-            self._thread = None
-        if self._boosted:
-            self._restore()
+            if not self._thread.is_alive():
+                self._thread = None
+        # Wait for an in-flight write before restoring. A queued writer checks
+        # the stop flag while holding this same lock and cannot write afterward.
+        with self._lock:
+            if self._boosted or self._restore_pending:
+                self._restore()
 
     def _run(self) -> None:
         while not self._stop.wait(self.config.poll_interval_sec):
             try:
                 running = running_watched_apps(self.config.apps)
-                if running and not self._boosted:
+                if self._restore_pending:
+                    self._restore()
+                elif running and not self._boosted:
                     self._apply_boost(running)
                 elif not running and self._boosted:
                     self._restore()
@@ -111,26 +123,53 @@ class AppBoostWatcher:
                 self._log(f"App boost bridge error: {exc}", "error")
 
     def _apply_boost(self, running: set[str]) -> None:
-        tuning = self._bridge.tuning_get()
-        if self.config.power_limit_pct is not None:
-            self._saved_power = tuning.get("power", {}).get("powerLimit")
-            self._bridge.set_power_limit(self.config.power_limit_pct)
-        if self.config.max_clock_mhz is not None:
-            self._saved_max_clock = tuning.get("gfx", {}).get("maxFreqMhz")
-            self._bridge.set_core_clocks(max_mhz=self.config.max_clock_mhz)
-        self._boosted = True
-        self._log(f"Boost ON ({', '.join(sorted(running))})", "volt")
+        with self._lock:
+            if self._stop.is_set() or self._restore_pending or self._boosted:
+                return
+            power, clock = self.config.power_limit_pct, self.config.max_clock_mhz
+            if power is None and clock is None:
+                return
+            if any(value is not None and type(value) is not int for value in (power, clock)):
+                raise BridgeError("App boost values must be integers")
+            tuning = self._bridge.tuning_get()
+            saved_power = tuning.get("power", {}).get("powerLimit") if power is not None else None
+            saved_clock = tuning.get("gfx", {}).get("maxFreqMhz") if clock is not None else None
+            if ((power is not None and type(saved_power) is not int)
+                    or (clock is not None and type(saved_clock) is not int)):
+                raise BridgeError("Cannot read a complete app boost baseline; no settings applied")
+            self._saved_power, self._saved_max_clock = saved_power, saved_clock
+            # Even a rejected driver call can have partially changed hardware.
+            self._boosted = True
+            try:
+                if power is not None:
+                    self._bridge.set_power_limit(power)
+                if clock is not None and not self._stop.is_set():
+                    self._bridge.set_core_clocks(max_mhz=clock)
+                if self._stop.is_set():
+                    self._restore()
+                    return
+            except Exception:
+                self._restore()
+                raise
+            self._log(f"Boost ON ({', '.join(sorted(running))})", "volt")
 
-    def _restore(self) -> None:
-        try:
-            if self._saved_power is not None:
-                self._bridge.set_power_limit(self._saved_power)
-            if self._saved_max_clock is not None:
-                self._bridge.set_core_clocks(max_mhz=self._saved_max_clock)
-            self._log("Boost OFF — watched apps closed", "volt")
-        except BridgeError as exc:
-            self._log(f"Boost restore failed: {exc}", "error")
-        finally:
-            self._boosted = False
-            self._saved_power = None
-            self._saved_max_clock = None
+    def _restore(self) -> bool:
+        with self._lock:
+            self._restore_pending = True
+            for attribute, setter in (
+                    ("_saved_power", self._bridge.set_power_limit),
+                    ("_saved_max_clock", lambda value: self._bridge.set_core_clocks(max_mhz=value))):
+                value = getattr(self, attribute)
+                if value is None:
+                    continue
+                try:
+                    setter(value)
+                except Exception as exc:
+                    self._log(f"Boost restore failed: {exc}", "error")
+                else:
+                    setattr(self, attribute, None)
+            self._restore_pending = self._saved_power is not None or self._saved_max_clock is not None
+            self._boosted = self._restore_pending
+            if not self._restore_pending:
+                self._log("Boost OFF — previous settings restored", "volt")
+            return not self._restore_pending

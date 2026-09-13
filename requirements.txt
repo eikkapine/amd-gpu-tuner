@@ -1,13 +1,5 @@
-# VoltShift Python dependencies (Python 3.12)
-customtkinter>=5.2      # modern dark GUI
-psutil>=5.9             # process detection for app boost and game tracking
-pywin32>=306            # Windows Event Log (crash logger, TDR detection)
-numpy>=1.26             # Gaussian-process optimiser behind Auto-Tune
-
-# Optional at runtime, detected automatically:
-#   Intel PresentMon     frame rate / 1% lows / stutter — scripts/fetch_presentmon.ps1
-#   RivaTuner (RTSS)     fallback frame source, used if it is already running
-
-# Build/test only:
-# pyinstaller>=6.0       # standalone .exe
-# pytest>=8.0            # unit tests
+# Runtime dependencies. Editable installs and extras: py -3.12 -m pip install -e ".[dev,build]"
+customtkinter>=5.2,<7
+psutil>=5.9,<8
+pywin32>=306; sys_platform == "win32"
+numpy>=1.26,<3

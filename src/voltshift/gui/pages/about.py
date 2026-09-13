@@ -6,7 +6,7 @@ import customtkinter as ctk
 
 from .. import theme
 from ..widgets import Card
-from ... import __version__
+from ... import APP_NAME, __version__
 from .base import Page
 
 
@@ -20,7 +20,7 @@ class AboutPage(Page):
         head.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         hbody = head.body()
         hbody.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(hbody, text="⚡ VoltShift", font=(theme.FONT, 26, "bold"),
+        ctk.CTkLabel(hbody, text=APP_NAME, font=(theme.FONT, 26, "bold"),
                      text_color=theme.TEXT, anchor="w").grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(hbody, text=f"Version {__version__} · Dynamic voltage control and "
                      "full tuning suite for AMD Radeon", font=(theme.FONT, 12),
@@ -35,9 +35,11 @@ class AboutPage(Page):
         safety.grid(row=2, column=0, sticky="ew", pady=(0, 12))
         sbody = safety.body()
         notes = [
-            "Positive voltage offsets are blocked — you cannot overvolt.",
-            "Every write is clamped to the ADLX-reported hardware range.",
-            "Stopping the engine or closing VoltShift restores AMD factory tuning.",
+            "Positive voltage offsets are rejected.",
+            "Tuning values outside driver-reported ranges or steps are rejected.",
+            "Opening the dashboard does not apply or reset GPU tuning.",
+            "Manual settings persist until reset. Stopping an active engine requests a restore.",
+            "Driver readback confirms settings; it does not prove stability.",
             "The crash logger is read-only; it never writes GPU state.",
             "If a crash leaves settings applied: Adrenalin → Performance → Tuning → Reset.",
         ]
@@ -51,7 +53,7 @@ class AboutPage(Page):
         cbody = credit.body()
         ctk.CTkLabel(cbody, text="Built on AMD's official ADLX SDK. The dynamic voltage "
                      "engine originates in ClawVolt; the tuning-suite scope is inspired by "
-                     "dumbie/RadeonTuner, reimplemented here on an original architecture.\n"
+                     "dumbie/RadeonTuner. Workflow improvements also take inspiration from b00nz/mVolt.\n"
                      "Not affiliated with or endorsed by AMD.",
                      font=(theme.FONT, 12), text_color=theme.TEXT_DIM, anchor="w",
                      justify="left", wraplength=760).grid(row=0, column=0, sticky="w")

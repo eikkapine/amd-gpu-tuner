@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -70,7 +71,7 @@ class BenchmarkTrial:
 
     @property
     def failed(self) -> bool:
-        return self.result is None or self.result.failed
+        return self.result is None or self.result.failed or self.score is None
 
     def describe(self) -> str:
         if self.failed:
@@ -105,7 +106,7 @@ def seed_candidates(space: SearchSpace, baseline: dict) -> list[dict]:
             if knob is None:
                 continue
             if fraction == "max":
-                candidate[name] = knob.high
+                candidate[name] = knob.clamp(knob.high)
             elif fraction == "min":
                 candidate[name] = knob.low
             else:
@@ -152,6 +153,10 @@ class BenchmarkSession:
         self._unsubscribe: Optional[Callable[[], None]] = None
         self._watcher: Optional[ResultWatcher] = None
         self._seeds: list[dict] = []
+        self._score_attr = "graphics"
+        self._run_started = 0.0
+        self._event_count = 0
+        self._abort_reason = ""
 
         self.state = SessionState.IDLE
         self.baseline: dict = {}
@@ -177,6 +182,7 @@ class BenchmarkSession:
         self._stop.clear()
         self.trials = []
         self.report = None
+        self._abort_reason = ""
         self._thread = threading.Thread(target=self._run, name="voltshift-bench",
                                         daemon=True)
         self._thread.start()
@@ -184,8 +190,10 @@ class BenchmarkSession:
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=15)
-            self._thread = None
+            if self._thread is not threading.current_thread():
+                self._thread.join(timeout=15)
+            if not self._thread.is_alive():
+                self._thread = None
 
     def _log(self, message: str, level: str = "info") -> None:
         if self.on_log:
@@ -204,7 +212,11 @@ class BenchmarkSession:
             self._execute()
         except Exception as exc:
             self._log(f"benchmark tuning failed: {exc}", "error")
-            self._revert()
+            try:
+                self._revert()
+            except Exception as recovery_exc:
+                self._log(f"recovery failed; journal retained: {recovery_exc}", "error")
+                exc = RuntimeError(f"{exc}; recovery failed: {recovery_exc}")
             self._finish(SessionState.FAILED, str(exc))
         finally:
             if self._unsubscribe:
@@ -214,6 +226,9 @@ class BenchmarkSession:
 
     def _execute(self) -> None:
         self.baseline = self._applier.read_current()
+        if any(self.baseline.get(name) is None for name in self._space.names):
+            return self._finish(SessionState.FAILED,
+                                "cannot read a complete baseline; no tuning applied")
         if self._watchdog is not None:
             self._watchdog.set_known_good(self.baseline)
 
@@ -234,7 +249,11 @@ class BenchmarkSession:
             return self._finish(SessionState.FAILED,
                                 "the baseline run failed; fix that before tuning")
 
-        self.baseline_score = baseline_result.objective
+        self._score_attr = "graphics" if baseline_result.graphics is not None else "overall"
+        self.baseline_score = self._result_score(baseline_result)
+        if self.baseline_score is None:
+            return self._finish(SessionState.FAILED,
+                                "the baseline has no positive finite score")
         if self._config.test is None:
             self._config.test = baseline_result.test
             self._watcher.test = baseline_result.test
@@ -282,6 +301,9 @@ class BenchmarkSession:
 
         result = self._wait_for_run()
         if result is None:
+            self._stop.set()
+            if self._abort_reason:
+                self._safeguard.mark_unsafe(candidate, "stability")
             self._log("timed out waiting for a benchmark result", "warn")
             return False
 
@@ -308,8 +330,9 @@ class BenchmarkSession:
             self._optimizer.observe(candidate, (self.baseline_score or 1.0) * 0.5)
             return BenchmarkTrial(index, candidate, result, None, None, "run failed")
 
-        score = result.objective
+        score = self._result_score(result)
         if score is None:
+            self._revert()
             return BenchmarkTrial(index, candidate, result, None, None, "no score")
 
         gain = (score - self.baseline_score) / self.baseline_score * 100.0
@@ -325,22 +348,38 @@ class BenchmarkSession:
     # ── waiting on the user's run ────────────────────────────────────────────
 
     def _await(self, message: str, index: int, config: dict) -> None:
+        self._run_started = time.monotonic()
+        self._event_count = len(self._stability.critical_events)
         if self.on_await_run:
             self.on_await_run(index, config)
         self._log(message)
 
     def _wait_for_run(self) -> Optional[BenchmarkResult]:
         result = self._watcher.wait(self._config.run_timeout_sec,
-                                    should_stop=self._stop.is_set)
-        if result is None:
+                                    should_stop=self._run_should_stop)
+        if self._run_should_stop():
             return None
-        # A thermal excursion during the run invalidates everything after it.
-        hottest = max((s.hotspot_c or 0) for s in self._hub.history(600)) \
-            if self._hub.history(600) else 0
-        if hottest >= HOTSPOT_ABORT_C:
-            self._log(f"hotspot reached {hottest:.0f}C during the run", "error")
-            self._stop.set()
         return result
+
+    def _run_should_stop(self) -> bool:
+        if self._stop.is_set():
+            return True
+        samples = [s for s in self._hub.history(600) if s.t >= self._run_started]
+        hottest = max((s.hotspot_c or 0 for s in samples), default=0)
+        if hottest >= HOTSPOT_ABORT_C:
+            self._abort_reason = f"hotspot reached {hottest:.0f}C during the run"
+        elif len(self._stability.critical_events) > self._event_count:
+            self._abort_reason = str(self._stability.critical_events[-1])
+        if self._abort_reason:
+            self._log(self._abort_reason, "error")
+            self._stop.set()
+        return self._stop.is_set()
+
+    def _result_score(self, result: BenchmarkResult) -> Optional[float]:
+        if self._config.test and result.test.lower() != self._config.test.lower():
+            return None
+        value = getattr(result, self._score_attr)
+        return value if value is not None and math.isfinite(value) and value > 0 else None
 
     # ── commit ───────────────────────────────────────────────────────────────
 
@@ -353,6 +392,10 @@ class BenchmarkSession:
             self._watchdog.abandon()
 
     def _commit_best(self) -> None:
+        if self._stop.is_set():
+            self._revert()
+            return self._finish(SessionState.ABORTED,
+                                f"{self._abort_reason or 'stopped'}; baseline restored")
         scored = [t for t in self.trials if not t.failed and t.score is not None]
         if not scored:
             self._revert()
@@ -368,6 +411,8 @@ class BenchmarkSession:
                 f"(±{self._config.min_gain_pct:.2f}%) — baseline kept")
 
         self._set_state(SessionState.CONFIRMING)
+        if self._watchdog is not None:
+            self._watchdog.journal(best.config, "benchmark confirmation")
         self._applier.apply(best.config)
         self._stability.note_change(best.config)
         self._log(f"confirming best: {self._space.describe(best.config)} "
@@ -376,20 +421,31 @@ class BenchmarkSession:
         confirmed = best.score
         for _ in range(self._config.confirm_runs):
             if self._stop.is_set():
-                break
+                self._revert()
+                return self._finish(SessionState.ABORTED, "stopped; baseline restored")
             self._await("run the benchmark once more to confirm the result",
                         -1, best.config)
             result = self._wait_for_run()
             if result is None:
-                break
+                self._revert()
+                return self._finish(SessionState.ABORTED,
+                                    "confirmation incomplete; baseline restored")
             if result.failed:
                 self._safeguard.mark_unsafe(best.config, "benchmark_failure")
                 self._revert()
                 return self._finish(SessionState.DONE,
                                     "the best configuration failed on re-test — "
                                     "baseline restored")
-            if result.objective is not None:
-                confirmed = result.objective
+            score = self._result_score(result)
+            if score is None:
+                self._revert()
+                return self._finish(SessionState.FAILED,
+                                    "confirmation has no comparable score; baseline restored")
+            confirmed = min(confirmed, score)
+
+        if self._stop.is_set():
+            self._revert()
+            return self._finish(SessionState.ABORTED, "stopped; baseline restored")
 
         gain = (confirmed - self.baseline_score) / self.baseline_score * 100.0
         if gain < self._config.min_gain_pct:
@@ -399,7 +455,15 @@ class BenchmarkSession:
                                 f"baseline restored")
 
         self._set_state(SessionState.APPLYING)
+        if self._stop.is_set():
+            self._revert()
+            return self._finish(SessionState.ABORTED, "stopped; baseline restored")
+        if self._watchdog is not None:
+            self._watchdog.journal(best.config, "benchmark result")
         self._applier.apply(best.config)
+        if self._stop.is_set():
+            self._revert()
+            return self._finish(SessionState.ABORTED, "stopped; baseline restored")
         if self._watchdog is not None:
             self._watchdog.verify(force=True)
         if self._knowledge is not None and self._gpu_key:

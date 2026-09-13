@@ -1,9 +1,4 @@
-"""VoltShift visual theme — a dark, electric-accented palette.
-
-The name is the identity: voltage shifting with clock. The accent gradient
-runs from a deep electric blue into a charged cyan-green, distinct from
-ClawVolt's old flat neon and from Adrenalin's red.
-"""
+"""AMD GPU Tuner theme: quiet dark surfaces with clear metric accents."""
 
 # Base surfaces (darkest -> lightest)
 BG = "#0d1017"          # window background
@@ -15,7 +10,7 @@ BORDER = "#2a3444"
 # Text
 TEXT = "#e6ecf5"
 TEXT_DIM = "#8a97ab"
-TEXT_FAINT = "#5c6675"
+TEXT_FAINT = "#8a96a8"
 
 # Accent — the "volt" gradient
 ACCENT = "#2f81f7"        # electric blue (primary)

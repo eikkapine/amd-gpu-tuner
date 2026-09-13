@@ -103,6 +103,7 @@ class AutoTuneSession:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._unsubscribe: Optional[Callable[[], None]] = None
+        self._critical_seen = 0
 
         self.state = SessionState.IDLE
         self.baseline: dict = {}
@@ -128,6 +129,7 @@ class AutoTuneSession:
         self._stop.clear()
         self.trials = []
         self.report = None
+        self._critical_seen = 0
         self._thread = threading.Thread(target=self._run, name="voltshift-autotune",
                                         daemon=True)
         self._thread.start()
@@ -136,8 +138,10 @@ class AutoTuneSession:
         """Abort and restore the baseline configuration."""
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=self._config.window_sec + 10)
-            self._thread = None
+            if self._thread is not threading.current_thread():
+                self._thread.join(timeout=self._config.window_sec + 10)
+            if not self._thread.is_alive():
+                self._thread = None
 
     # ── plumbing ─────────────────────────────────────────────────────────────
 
@@ -172,7 +176,10 @@ class AutoTuneSession:
         # before the sleep would depend on the platform clock's granularity
         # being finer than the window, which is not guaranteed.
         samples = self._hub.history(self._config.window_sec)
-        return WindowStats.from_samples(samples), self._stability.critical_events
+        events = self._stability.critical_events
+        fresh = events[self._critical_seen:]
+        self._critical_seen = len(events)
+        return WindowStats.from_samples(samples), fresh
 
     def _apply(self, config: dict, journal_reason: Optional[str] = None) -> None:
         if self._watchdog is not None and journal_reason:
@@ -186,10 +193,7 @@ class AutoTuneSession:
             self._applier.apply(self.baseline, skip_unchanged=False)
         except Exception as exc:
             self._log(f"revert failed, forcing factory reset: {exc}", "error")
-            try:
-                self._applier.reset()
-            except Exception:
-                pass
+            self._applier.reset()
         if self._watchdog is not None:
             self._watchdog.abandon()
 
@@ -201,7 +205,11 @@ class AutoTuneSession:
             self._execute()
         except Exception as exc:  # a crashed tuner must still restore the GPU
             self._log(f"auto-tune failed: {exc}", "error")
-            self._revert_to_baseline()
+            try:
+                self._revert_to_baseline()
+            except Exception as recovery_exc:
+                self._log(f"recovery failed; journal retained: {recovery_exc}", "error")
+                exc = RuntimeError(f"{exc}; recovery failed: {recovery_exc}")
             self._set_state(SessionState.FAILED)
             self.report = SessionReport(SessionState.FAILED, self.baseline, None,
                                         None, self.trials, str(exc))
@@ -215,6 +223,9 @@ class AutoTuneSession:
 
     def _execute(self) -> None:
         self.baseline = self._applier.read_current()
+        if any(name not in self.baseline for name in self._space.names):
+            return self._finish(SessionState.FAILED,
+                                "cannot read a complete baseline; no tuning applied")
         self._log(f"baseline: {self._space.describe(self.baseline)}")
 
         # Baseline is safe by definition — it is what the machine is already
@@ -224,11 +235,14 @@ class AutoTuneSession:
 
         self._set_state(SessionState.BASELINE)
         self._progress("measuring baseline", 0.0)
-        baseline_window, _ = self._collect_window()
+        baseline_window, baseline_events = self._collect_window()
         if self._stop.is_set():
             return self._finish(SessionState.ABORTED, "stopped before any trial ran")
         if not baseline_window.is_usable(self._config.min_samples_per_window):
             return self._finish(SessionState.FAILED, "no telemetry — is the bridge alive?")
+        if baseline_events:
+            return self._finish(SessionState.FAILED,
+                                "baseline is unstable; no tuning applied")
 
         self._stability.set_reference_clock(baseline_window.clock_mhz)
         if baseline_window.has_frames:
@@ -252,7 +266,7 @@ class AutoTuneSession:
                 self.on_trial(result)
 
         self._revert_to_baseline()
-        if self._stop.is_set() and not self.trials:
+        if self._stop.is_set():
             return self._finish(SessionState.ABORTED, "stopped")
 
         self._commit_best()
@@ -304,12 +318,16 @@ class AutoTuneSession:
                 unstable_reason = str(fired[0])
                 self._log(f"instability: {unstable_reason}", "error")
                 break
-            if window.is_usable(self._config.min_samples_per_window):
-                candidate_windows.append(window)
+            candidate_window = window
 
             self._apply(self.baseline)
-            window, _ = self._collect_window()
-            if window.is_usable(self._config.min_samples_per_window):
+            window, fired = self._collect_window()
+            if fired:
+                self._revert_to_baseline()
+                raise RuntimeError(f"baseline became unstable: {fired[0]}")
+            if (candidate_window.is_usable(self._config.min_samples_per_window)
+                    and window.is_usable(self._config.min_samples_per_window)):
+                candidate_windows.append(candidate_window)
                 baseline_windows.append(window)
 
         self._revert_to_baseline()
@@ -345,6 +363,9 @@ class AutoTuneSession:
     # ── commit ───────────────────────────────────────────────────────────────
 
     def _commit_best(self) -> None:
+        if self._stop.is_set():
+            self._revert_to_baseline()
+            return self._finish(SessionState.ABORTED, "stopped; baseline restored")
         stable = [t for t in self.trials if t.stable and t.value > 0]
         if not stable:
             return self._finish(SessionState.DONE,
@@ -371,12 +392,24 @@ class AutoTuneSession:
             if fired:
                 unstable_reason = str(fired[0])
                 break
-            if window.is_usable(self._config.min_samples_per_window):
-                confirm_candidate.append(window)
+            candidate_window = window
             self._apply(self.baseline)
-            window, _ = self._collect_window()
-            if window.is_usable(self._config.min_samples_per_window):
+            window, fired = self._collect_window()
+            if fired:
+                self._revert_to_baseline()
+                raise RuntimeError(f"baseline became unstable: {fired[0]}")
+            if (candidate_window.is_usable(self._config.min_samples_per_window)
+                    and window.is_usable(self._config.min_samples_per_window)):
+                confirm_candidate.append(candidate_window)
                 confirm_baseline.append(window)
+
+        if self._stop.is_set():
+            self._revert_to_baseline()
+            return self._finish(SessionState.ABORTED, "stopped; baseline restored")
+        if not unstable_reason and len(confirm_candidate) < self._config.confirm_pairs:
+            self._revert_to_baseline()
+            return self._finish(SessionState.DONE,
+                                "confirmation telemetry was incomplete; baseline restored")
 
         confirmed = score_trial(confirm_candidate, confirm_baseline,
                                 self._config.goal, unstable_reason)
@@ -390,7 +423,13 @@ class AutoTuneSession:
                                 "baseline restored")
 
         self._set_state(SessionState.APPLYING)
+        if self._stop.is_set():
+            self._revert_to_baseline()
+            return self._finish(SessionState.ABORTED, "stopped; baseline restored")
         self._apply(best.config, "auto-tune result")
+        if self._stop.is_set():
+            self._revert_to_baseline()
+            return self._finish(SessionState.ABORTED, "stopped; baseline restored")
         if self._watchdog is not None:
             self._watchdog.verify(force=True)
         if self._knowledge is not None and self._gpu_key:

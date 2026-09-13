@@ -1,9 +1,12 @@
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from voltshift.adaptive import (PHASE_CONFIRM_TICKS, AdaptiveGovernor, Phase,
                                 ProbeBudget, classify)
+from voltshift.bridgeclient import BridgeError
 from voltshift.optimizer import RecordingApplier, Safeguard, SearchSpace
 from voltshift.optimizer.space import VOLTAGE
 from voltshift.telemetry.sample import FrameStats, Sample
@@ -260,3 +263,257 @@ def test_status_reports_the_governors_view():
     assert status.phase == Phase.IDLE
     assert status.probes_left == 5
     assert status.game is None
+
+
+class RecordingWatchdog:
+    def __init__(self):
+        self.pending = None
+        self.journals = []
+
+    def journal(self, config, reason):
+        self.pending = dict(config)
+        self.journals.append((dict(config), reason))
+
+    def abandon(self):
+        self.pending = None
+
+
+def _probe_governor():
+    governor, applier, hub, guard = _governor(
+        initial={VOLTAGE: -40, "max_clock_mhz": 3100},
+        budget=ProbeBudget(max_probes=4, min_interval_sec=0,
+                           settle_sec=0, window_sec=0))
+    governor._desktop_config = {VOLTAGE: 0, "max_clock_mhz": 3100}
+    governor._phase = Phase.HEAVY
+    governor._watchdog = RecordingWatchdog()
+    return governor, applier, hub, guard
+
+
+def test_rejected_probe_journal_describes_the_restored_baseline(monkeypatch):
+    governor, applier, _, _ = _probe_governor()
+    baseline = applier.read_current()
+    monkeypatch.setattr("voltshift.adaptive.score_trial", lambda *args: SimpleNamespace(
+        unstable=False, value=-1, explain=lambda: "no improvement"))
+
+    governor._run_probe()
+
+    assert applier.current == baseline
+    assert governor._watchdog.pending == baseline
+    assert governor._watchdog.journals[-1][1] == "governor probe baseline"
+
+
+def test_each_probe_transition_is_journaled_before_the_hardware_write(monkeypatch):
+    governor, applier, _, _ = _probe_governor()
+    apply = applier.apply
+    reasons = []
+
+    def checked_apply(config, **kwargs):
+        assert governor._watchdog.pending == config
+        reasons.append(governor._watchdog.journals[-1][1])
+        return apply(config, **kwargs)
+
+    monkeypatch.setattr(applier, "apply", checked_apply)
+    monkeypatch.setattr("voltshift.adaptive.score_trial", lambda *args: SimpleNamespace(
+        unstable=False, value=1, explain=lambda: "better efficiency"))
+
+    governor._run_probe()
+
+    assert reasons == ["governor probe", "governor probe baseline",
+                       "governor probe accepted"]
+    assert applier.current[VOLTAGE] < -40
+    assert governor._watchdog.pending == applier.current
+
+
+def test_probe_restores_after_a_partially_successful_write(monkeypatch):
+    governor, applier, _, _ = _probe_governor()
+    baseline = applier.read_current()
+    apply = applier.apply
+
+    def partial_failure(config, **kwargs):
+        apply(config, **kwargs)
+        if config != baseline:
+            raise BridgeError("voltage write failed after clock write")
+
+    monkeypatch.setattr(applier, "apply", partial_failure)
+    governor._run_probe()
+
+    assert applier.current == baseline
+    assert governor._watchdog.pending is None
+    assert governor._budget.failures == 1
+    assert governor._budget.exhausted
+
+
+def test_probe_measurement_error_restores_previous_configuration(monkeypatch):
+    governor, applier, _, _ = _probe_governor()
+    baseline = applier.read_current()
+
+    def failed_measurement():
+        raise RuntimeError("telemetry stopped")
+
+    monkeypatch.setattr(governor, "_measure", failed_measurement)
+    governor._run_probe()
+
+    assert applier.current == baseline
+    assert governor._watchdog.pending is None
+
+
+def test_broken_log_observer_cannot_prevent_probe_recovery(monkeypatch):
+    governor, applier, _, _ = _probe_governor()
+    baseline = applier.read_current()
+
+    def failed_measurement():
+        raise RuntimeError("telemetry stopped")
+
+    def failed_logger(*args):
+        raise RuntimeError("GUI closed")
+
+    monkeypatch.setattr(governor, "_measure", failed_measurement)
+    governor.on_log = failed_logger
+    governor._run_probe()
+    assert applier.current == baseline
+    assert governor._watchdog.pending is None
+    assert governor._budget.failures == 1
+
+
+def test_failed_restore_uses_reset_and_retains_journal_if_reset_fails(monkeypatch):
+    governor, applier, _, _ = _probe_governor()
+    resets = []
+
+    def failed_apply(*args, **kwargs):
+        raise BridgeError("driver unavailable")
+
+    def failed_reset():
+        resets.append(True)
+        raise BridgeError("reset unavailable")
+
+    monkeypatch.setattr(applier, "apply", failed_apply)
+    monkeypatch.setattr(applier, "reset", failed_reset)
+    governor._run_probe()
+
+    assert resets == [True]
+    assert governor._watchdog.pending is not None
+    assert "probe recovery failed" in governor.status().last_note
+
+
+def _start_long_probe(governor, applier, monkeypatch):
+    governor._budget.settle_sec = 60
+    governor._budget.window_sec = 60
+    governor._phase_since = time.monotonic() - 300
+    applied = threading.Event()
+    apply = applier.apply
+
+    def signal_apply(config, **kwargs):
+        result = apply(config, **kwargs)
+        applied.set()
+        return result
+
+    monkeypatch.setattr(applier, "apply", signal_apply)
+    governor._maybe_probe(governor._hub.latest)
+    assert applied.wait(2), "the simulated probe did not start"
+
+
+def test_critical_event_interrupts_active_probe_without_waiting_for_measurement(monkeypatch):
+    from voltshift.stability import SEVERITY_CRITICAL, StabilityEvent
+
+    governor, applier, _, _ = _probe_governor()
+    _start_long_probe(governor, applier, monkeypatch)
+    probe_thread = governor._probe_thread
+    callback = threading.Thread(target=governor._on_stability_event, args=(
+        StabilityEvent("tdr", SEVERITY_CRITICAL, "driver reset"),), daemon=True)
+    try:
+        callback.start()
+        callback.join(timeout=2)
+        assert not callback.is_alive(), "emergency recovery waited for the probe"
+        probe_thread.join(timeout=2)
+        assert not probe_thread.is_alive()
+        assert applier.current == governor._desktop_config
+        assert governor._budget.failures == 1
+        assert governor._watchdog.pending is None
+    finally:
+        governor.stop()
+        callback.join(timeout=2)
+
+
+def test_stop_joins_the_probe_before_restoring_desktop(monkeypatch):
+    governor, applier, _, _ = _probe_governor()
+    _start_long_probe(governor, applier, monkeypatch)
+    probe_thread = governor._probe_thread
+
+    governor.stop()
+
+    assert not probe_thread.is_alive()
+    assert governor._probe_thread is None
+    assert applier.current == governor._desktop_config
+    assert applier.history[-1] == governor._desktop_config
+    assert governor._watchdog.pending is None
+
+
+def test_stop_without_desktop_restore_still_backs_out_unfinished_probe(monkeypatch):
+    governor, applier, _, _ = _probe_governor()
+    baseline = applier.read_current()
+    _start_long_probe(governor, applier, monkeypatch)
+
+    governor.stop(restore=False)
+
+    assert applier.current == baseline
+    assert governor._probe_thread is None
+
+
+def test_fault_during_baseline_measurement_never_reapplies_candidate(monkeypatch):
+    from voltshift.stability import SEVERITY_CRITICAL, StabilityEvent
+
+    governor, applier, _, guard = _probe_governor()
+    measure = governor._measure
+    measurements = []
+    candidate = governor._propose_probe(applier.read_current())
+
+    def fault_in_baseline_window():
+        measurements.append(True)
+        window = measure()
+        if len(measurements) == 2:
+            governor._on_stability_event(StabilityEvent(
+                "tdr", SEVERITY_CRITICAL, "delayed reset", config=candidate))
+        return window
+
+    monkeypatch.setattr(governor, "_measure", fault_in_baseline_window)
+    governor._run_probe()
+
+    assert len(measurements) == 2
+    assert applier.current == governor._desktop_config
+    assert applier.history[-1] == governor._desktop_config
+    assert not guard.check(candidate, candidate).ok
+
+
+def test_critical_event_still_restores_when_recording_failure_fails(monkeypatch):
+    from voltshift.stability import SEVERITY_CRITICAL, StabilityEvent
+
+    governor, applier, _, guard = _probe_governor()
+
+    def failed_record(*args):
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(guard, "mark_unsafe", failed_record)
+    with pytest.raises(OSError, match="database unavailable"):
+        governor._on_stability_event(StabilityEvent(
+            "tdr", SEVERITY_CRITICAL, "driver reset"))
+
+    assert applier.current == governor._desktop_config
+
+
+def test_ramp_write_failure_restores_desktop_and_clears_target(monkeypatch):
+    governor, applier, _, _ = _probe_governor()
+    governor._target = {VOLTAGE: -80, "max_clock_mhz": 3100}
+    apply = applier.apply
+
+    def failed_ramp(config, **kwargs):
+        if config != governor._desktop_config:
+            raise BridgeError("driver rejected ramp")
+        return apply(config, **kwargs)
+
+    monkeypatch.setattr(applier, "apply", failed_ramp)
+    with pytest.raises(BridgeError, match="driver rejected ramp"):
+        governor._ramp_toward_target()
+
+    assert applier.current == governor._desktop_config
+    assert governor._target is None
+    assert governor._budget.exhausted

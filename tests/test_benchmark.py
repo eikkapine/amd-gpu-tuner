@@ -255,7 +255,7 @@ def test_session_stays_above_the_failure_cliff(tmp_path, space):
 
 
 def test_a_failed_run_marks_the_configuration_unsafe(tmp_path, space):
-    applier = RecordingApplier({VOLTAGE: 0, POWER_LIMIT: 0})
+    applier = RecordingApplier(space.default_config())
     guard = Safeguard(space)
     config = BenchmarkConfig(trials=1, test="TimeSpy", run_timeout_sec=6.0,
                              results_dir=str(tmp_path), seed_candidates=False)
@@ -278,7 +278,7 @@ def test_a_failed_run_marks_the_configuration_unsafe(tmp_path, space):
 
 def test_gains_inside_the_noise_floor_are_not_committed(tmp_path, space):
     """A 0.1% "win" on a benchmark whose runs vary by 0.18% is not a win."""
-    applier = RecordingApplier({VOLTAGE: 0, POWER_LIMIT: 0})
+    applier = RecordingApplier(space.default_config())
     config = BenchmarkConfig(trials=2, test="TimeSpy", run_timeout_sec=6.0,
                              results_dir=str(tmp_path), seed_candidates=False,
                              min_gain_pct=0.4)
@@ -298,7 +298,7 @@ def test_gains_inside_the_noise_floor_are_not_committed(tmp_path, space):
 
 
 def test_missing_baseline_run_aborts_cleanly(tmp_path, space):
-    applier = RecordingApplier({VOLTAGE: 0, POWER_LIMIT: 0})
+    applier = RecordingApplier(space.default_config())
     config = BenchmarkConfig(trials=2, test="TimeSpy", run_timeout_sec=1.0,
                              results_dir=str(tmp_path), seed_candidates=False)
     session = BenchmarkSession(FakeHub(), applier, space, Safeguard(space),
@@ -307,3 +307,26 @@ def test_missing_baseline_run_aborts_cleanly(tmp_path, space):
     report = _run(session, timeout=20)
     assert report.state == SessionState.ABORTED
     assert applier.current[VOLTAGE] == 0
+
+
+@pytest.mark.parametrize("baseline", [{}, {VOLTAGE: 0, POWER_LIMIT: 0}])
+def test_incomplete_tuning_baseline_fails_before_any_write(space, monkeypatch, baseline):
+    from voltshift.optimizer import benchsession
+
+    applier = RecordingApplier(baseline)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("incomplete readback must fail before journaling or waiting for a benchmark")
+
+    class Watchdog:
+        set_known_good = unexpected
+
+    monkeypatch.setattr(benchsession, "ResultWatcher", unexpected)
+    session = BenchmarkSession(FakeHub(), applier, space, Safeguard(space),
+                               make_optimizer(space, seed=1), watchdog=Watchdog())
+    session._execute()
+    assert session.report.state == SessionState.FAILED
+    assert "complete baseline" in session.report.message
+    assert session.report.best_config is None
+    assert applier.history == []
+    assert applier.reset_count == 0

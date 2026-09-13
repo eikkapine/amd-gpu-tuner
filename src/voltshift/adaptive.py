@@ -44,6 +44,10 @@ from .telemetry.window import WindowStats
 PHASE_CONFIRM_TICKS = 5
 
 
+class _ProbeCancelled(Exception):
+    """An experiment was interrupted before its result could be accepted."""
+
+
 class Phase(Enum):
     IDLE = "idle"
     MENU = "menu"
@@ -153,9 +157,14 @@ class AdaptiveGovernor:
         self._tick = tick_sec
 
         self._thread: Optional[threading.Thread] = None
+        self._probe_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._probe_cancel = threading.Event()
+        self._probe_faulted = False
         self._unsubscribe: Optional[Callable[[], None]] = None
         self._probe_lock = threading.Lock()
+        # Serialise writes and their journals, never measurement windows.
+        self._state_lock = threading.RLock()
 
         self._game: Optional[GameProcess] = None
         self._phase = Phase.IDLE
@@ -180,6 +189,8 @@ class AdaptiveGovernor:
         if self.running:
             return
         self._stop.clear()
+        self._probe_cancel.clear()
+        self._probe_faulted = False
         self._desktop_config = self._applier.read_current()
         if self._watchdog is not None:
             self._watchdog.set_known_good(self._desktop_config)
@@ -192,18 +203,21 @@ class AdaptiveGovernor:
 
     def stop(self, restore: bool = True) -> None:
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=self._tick + 5)
+        self._probe_cancel.set()
+        current_thread = threading.current_thread()
+        if self._thread and self._thread is not current_thread:
+            self._thread.join()
             self._thread = None
+        if self._probe_thread and self._probe_thread is not current_thread:
+            self._probe_thread.join()
+            self._probe_thread = None
         if self._unsubscribe:
             self._unsubscribe()
             self._unsubscribe = None
         self._stability.on_event = None
-        if restore and self._desktop_config:
-            try:
-                self._applier.apply(self._desktop_config, skip_unchanged=False)
-            except Exception:
-                self._applier.reset()
+        if restore:
+            with self._state_lock:
+                self._revert(self._desktop_config, "desktop configuration restored")
         self._log("adaptive governor stopped")
 
     # ── plumbing ─────────────────────────────────────────────────────────────
@@ -211,7 +225,11 @@ class AdaptiveGovernor:
     def _log(self, message: str, level: str = "info") -> None:
         self._note = message
         if self.on_log:
-            self.on_log(message, level)
+            try:
+                self.on_log(message, level)
+            except Exception:
+                # A closed GUI or broken observer must never interrupt recovery.
+                pass
 
     def status(self) -> GovernorStatus:
         return GovernorStatus(
@@ -233,22 +251,23 @@ class AdaptiveGovernor:
         """Fired from the telemetry thread the moment something looks wrong."""
         if not event.critical:
             return
-        with self._probe_lock:
+        with self._state_lock:
+            self._probe_cancel.set()
+            self._probe_faulted = True
             self._budget.failures += 1
-        config = self._applier.last_applied or {}
-        self._log(f"instability ({event.kind}) — reverting: {event.detail}", "error")
-        self._safeguard.mark_unsafe(config, event.kind)
-        if self._knowledge is not None and self._gpu_key:
-            latest = self._hub.latest
-            self._knowledge.record_failure(self._gpu_key, config.get(VOLTAGE),
-                                           latest.clock_mhz if latest else None)
-        try:
-            self._applier.apply(self._desktop_config, skip_unchanged=False)
-        except Exception:
-            self._applier.reset()
-        if self._watchdog is not None:
-            self._watchdog.abandon()
-        self._target = None
+            self._target = None
+            config = event.config or self._applier.last_applied or {}
+            try:
+                self._safeguard.mark_unsafe(config, event.kind)
+                if self._knowledge is not None and self._gpu_key:
+                    latest = self._hub.latest
+                    self._knowledge.record_failure(self._gpu_key, config.get(VOLTAGE),
+                                                   latest.clock_mhz if latest else None)
+            finally:
+                # Persistence errors must never prevent the emergency restore.
+                self._revert(self._desktop_config,
+                             f"instability ({event.kind}) — reverted: {event.detail}")
+                self._stability.reset()
 
     # ── main loop ────────────────────────────────────────────────────────────
 
@@ -260,6 +279,11 @@ class AdaptiveGovernor:
                 self._log(f"governor error: {exc}", "error")
 
     def _step(self) -> None:
+        with self._state_lock:
+            if not self._stop.is_set():
+                self._step_locked()
+
+    def _step_locked(self) -> None:
         sample = self._hub.latest
         if sample is None:
             return
@@ -267,7 +291,7 @@ class AdaptiveGovernor:
         self._track_game()
         self._track_phase(sample)
 
-        if self._watchdog is not None:
+        if self._watchdog is not None and not self._probe_lock.locked():
             self._watchdog.verify()
 
         if self._target is not None:
@@ -285,6 +309,7 @@ class AdaptiveGovernor:
 
         if found is None:
             if previous is not None:
+                self._probe_cancel.set()
                 self._log(f"{previous.exe} closed — restoring desktop configuration")
                 self._game = None
                 self._target = dict(self._desktop_config)
@@ -297,6 +322,7 @@ class AdaptiveGovernor:
         if previous is not None and previous.exe == found.exe:
             return
 
+        self._probe_cancel.set()
         self._game = found
         self._budget.spent = 0
         self._budget.failures = 0
@@ -353,6 +379,7 @@ class AdaptiveGovernor:
             self._pending_ticks = 1
 
         if self._pending_ticks >= PHASE_CONFIRM_TICKS:
+            self._probe_cancel.set()
             self._phase = phase
             self._phase_since = time.monotonic()
             self._pending_phase = None
@@ -369,6 +396,21 @@ class AdaptiveGovernor:
         wrong for this card is discovered part-way there, at a value the card
         can still recover from.
         """
+        with self._state_lock:
+            if self._stop.is_set():
+                return
+            if self._probe_lock.locked():
+                self._probe_cancel.set()
+                return
+            try:
+                self._ramp_step()
+            except Exception:
+                self._target = None
+                self._budget.failures += 1
+                self._revert(self._desktop_config, "ramp failed — desktop restored")
+                raise
+
+    def _ramp_step(self) -> None:
         target = self._target
         if target is None:
             return
@@ -402,6 +444,12 @@ class AdaptiveGovernor:
     # ── probing ──────────────────────────────────────────────────────────────
 
     def _maybe_probe(self, sample: Sample) -> None:
+        with self._state_lock:
+            if self._stop.is_set():
+                return
+            self._start_probe_if_ready(sample)
+
+    def _start_probe_if_ready(self, sample: Sample) -> None:
         now = time.monotonic()
         if not self._budget.ready(now):
             return
@@ -413,70 +461,100 @@ class AdaptiveGovernor:
             return
         if not self._probe_lock.acquire(blocking=False):
             return
-        threading.Thread(target=self._run_probe, name="voltshift-probe",
-                         daemon=True).start()
+        self._probe_cancel.clear()
+        self._probe_faulted = False
+        self._probe_thread = threading.Thread(target=self._run_probe,
+                                               name="voltshift-probe", daemon=True)
+        try:
+            self._probe_thread.start()
+        except Exception:
+            self._probe_lock.release()
+            raise
 
     def _run_probe(self) -> None:
         """One paired micro-experiment, then keep it or put it back."""
+        baseline = None
+        changed = False
         try:
-            baseline = self._applier.read_current()
-            candidate = self._propose_probe(baseline)
-            if candidate is None or candidate == baseline:
-                return
+            with self._state_lock:
+                self._check_probe_active()
+                baseline = self._applier.read_current()
+                candidate = self._propose_probe(baseline)
+                if candidate is None or candidate == baseline:
+                    return
 
-            self._budget.spent += 1
-            self._budget.last_probe_t = time.monotonic()
-            self._log(f"probe {self._budget.spent}/{self._budget.max_probes}: "
-                      f"{self._space.describe(candidate)}")
-
-            start_phase = self._phase
-            if self._watchdog is not None:
-                self._watchdog.journal(candidate, "governor probe")
-            self._applier.apply(candidate)
-            self._stability.note_change(candidate)
+                self._budget.spent += 1
+                self._budget.last_probe_t = time.monotonic()
+                self._log(f"probe {self._budget.spent}/{self._budget.max_probes}: "
+                          f"{self._space.describe(candidate)}")
+                start_phase, start_game = self._phase, self._game
+                # A failed apply may still have written some of the knobs.
+                changed = True
+                self._apply_probe(candidate, "governor probe")
             candidate_window = self._measure()
 
-            if self._budget.failures or self._phase != start_phase:
-                self._revert(baseline, "probe abandoned — "
-                             + ("instability" if self._budget.failures
-                                else "workload changed"))
-                return
-
-            self._applier.apply(baseline)
-            self._stability.note_change(baseline)
+            with self._state_lock:
+                self._check_probe_context(start_phase, start_game)
+                self._apply_probe(baseline, "governor probe baseline")
             baseline_window = self._measure()
 
-            if self._phase != start_phase:
-                self._revert(baseline, "probe inconclusive — workload changed")
-                return
+            with self._state_lock:
+                self._check_probe_context(start_phase, start_game)
+                score = score_trial([candidate_window], [baseline_window], self._goal)
+                if self._knowledge is not None and self._gpu_key and self._game:
+                    self._knowledge.record_observation(
+                        self._gpu_key, self._game.exe, self._goal, candidate,
+                        score.value, stable=not score.unstable,
+                        fps_avg=candidate_window.fps_avg, fps_p1=candidate_window.fps_p1,
+                        board_w=candidate_window.board_w,
+                        hotspot_c=candidate_window.hotspot_c)
 
-            score = score_trial([candidate_window], [baseline_window], self._goal)
-            if self._knowledge is not None and self._gpu_key and self._game:
-                self._knowledge.record_observation(
-                    self._gpu_key, self._game.exe, self._goal, candidate,
-                    score.value, stable=not score.unstable,
-                    fps_avg=candidate_window.fps_avg, fps_p1=candidate_window.fps_p1,
-                    board_w=candidate_window.board_w,
-                    hotspot_c=candidate_window.hotspot_c)
+                if score.unstable or score.value <= 0:
+                    self._log(f"probe rejected ({score.explain()})")
+                    return
 
-            if score.unstable or score.value <= 0:
-                self._log(f"probe rejected ({score.explain()})")
-                return
-
-            self._applier.apply(candidate)
-            if self._watchdog is not None:
-                self._watchdog.journal(candidate, "governor probe accepted")
-            self._log(f"probe accepted: {score.explain()}")
-            if self._knowledge is not None and self._gpu_key and self._game:
-                self._knowledge.record_best(self._gpu_key, self._game.exe,
-                                            self._goal, candidate, score.value)
+                self._apply_probe(candidate, "governor probe accepted")
+                self._log(f"probe accepted: {score.explain()}")
+                if self._knowledge is not None and self._gpu_key and self._game:
+                    self._knowledge.record_best(self._gpu_key, self._game.exe,
+                                                self._goal, candidate, score.value)
+        except _ProbeCancelled:
+            with self._state_lock:
+                # The stability callback owns the emergency desktop restore.
+                # Never overwrite it with the experiment's previous profile.
+                if changed and not self._probe_faulted:
+                    self._revert(baseline, "probe abandoned — interrupted")
         except Exception as exc:
             self._log(f"probe failed: {exc}", "error")
+            with self._state_lock:
+                self._budget.failures += 1
+                self._target = None
+                if changed and not self._probe_faulted:
+                    try:
+                        self._revert(baseline, "probe failed — restored previous configuration")
+                    except Exception as recovery_exc:
+                        self._log(f"probe recovery failed: {recovery_exc}", "error")
         finally:
             try:
                 self._probe_lock.release()
             except RuntimeError:
                 pass
+
+    def _check_probe_active(self) -> None:
+        if self._stop.is_set() or self._probe_cancel.is_set():
+            raise _ProbeCancelled()
+
+    def _check_probe_context(self, phase: Phase, game: Optional[GameProcess]) -> None:
+        self._check_probe_active()
+        if self._phase != phase or self._game != game:
+            raise _ProbeCancelled()
+
+    def _apply_probe(self, config: dict, reason: str) -> None:
+        self._check_probe_active()
+        if self._watchdog is not None:
+            self._watchdog.journal(config, reason)
+        self._applier.apply(config, skip_unchanged=False)
+        self._stability.note_change(config)
 
     def _propose_probe(self, current: dict) -> Optional[dict]:
         """A single small step, biased toward the knob with room to move.
@@ -513,12 +591,21 @@ class AdaptiveGovernor:
         return pool[self._budget.spent % len(pool)]
 
     def _measure(self) -> WindowStats:
-        time.sleep(self._budget.settle_sec)
-        time.sleep(self._budget.window_sec)
+        for duration in (self._budget.settle_sec, self._budget.window_sec):
+            if self._probe_cancel.wait(duration):
+                raise _ProbeCancelled()
+            self._check_probe_active()
         return WindowStats.from_samples(self._hub.history(self._budget.window_sec))
 
     def _revert(self, baseline: dict, reason: str) -> None:
-        self._applier.apply(baseline, skip_unchanged=False)
+        try:
+            if baseline:
+                self._applier.apply(baseline, skip_unchanged=False)
+            else:
+                self._applier.reset()
+        except Exception:
+            self._applier.reset()
+        # Preserve the pending journal when both restoration paths fail.
         if self._watchdog is not None:
             self._watchdog.abandon()
         self._log(reason, "warn")

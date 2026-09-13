@@ -1,7 +1,7 @@
-"""VoltShift GUI launcher.
+"""AMD GPU Tuner GUI launcher.
 
 Run from source:  py -3.12 src/voltshift_gui.py
-Frozen build:     VoltShift.exe
+Frozen build:     AMD-GPU-Tuner.exe
 
 Kept as a thin top-level module so the PyInstaller spec has a stable entry
 point regardless of package layout.
